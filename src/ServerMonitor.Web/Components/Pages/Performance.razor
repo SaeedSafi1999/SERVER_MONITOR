@@ -1,0 +1,148 @@
+@page "/performance"
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject MetricsQueryService Metrics
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+
+<PageTitle>Performance · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Performance</h1>
+        <div class="sub">Live resource table and multi-server comparison</div>
+    </div>
+</div>
+
+<div class="glass table-wrap mb-4">
+    <table class="table-dark-glass">
+        <thead>
+            <tr>
+                <th class="sortable" @onclick='() => _sort = "name"'>Server</th>
+                <th class="sortable" @onclick='() => _sort = "cpu"'>CPU</th>
+                <th class="sortable" @onclick='() => _sort = "mem"'>RAM</th>
+                <th class="sortable" @onclick='() => _sort = "disk"'>Disk</th>
+                <th>Load 1/5/15</th><th>Disk I/O (r/w)</th><th>Processes</th><th>Threads</th><th>FDs / handles</th><th>Sessions</th><th>Uptime</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var s in Sorted)
+            {
+                var m = s.Sample?.Snapshot;
+                <tr>
+                    <td><a href="servers/@s.ServerId">@s.Name</a> <StatusBadge Status="s.Status" /></td>
+                    <td style="min-width:120px"><MeterBar Value="m?.CpuPercent" /></td>
+                    <td style="min-width:120px"><MeterBar Value="m?.MemPercent" /></td>
+                    <td style="min-width:120px"><MeterBar Value="m?.DiskPercent" /></td>
+                    <td class="mono small">@Fmt.Num(m?.Load1) / @Fmt.Num(m?.Load5) / @Fmt.Num(m?.Load15)</td>
+                    <td class="small">@Fmt.Bytes(m?.DiskReadBytesPerSec)/s · @Fmt.Bytes(m?.DiskWriteBytesPerSec)/s</td>
+                    <td>@m?.ProcessCount</td>
+                    <td>@m?.ThreadCount</td>
+                    <td>@Fmt.Num(m?.OpenFileDescriptors, "0")</td>
+                    <td>@m?.ActiveSessions</td>
+                    <td class="small">@Fmt.Uptime(m?.UptimeSeconds ?? 0)</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+<div class="glass form-section">
+    <h2>Compare servers</h2>
+    <div class="d-flex flex-wrap gap-2 mb-3">
+        @foreach (var s in _servers)
+        {
+            <button class="chip @(_selected.Contains(s.Id) ? "active" : "")" @onclick="() => ToggleAsync(s.Id)">@s.Name</button>
+        }
+    </div>
+    <div class="d-flex flex-wrap gap-2 align-items-center">
+        <select class="form-select form-select-sm w-auto" @bind="_metric" @bind:after="LoadAsync">
+            <option value="@MetricSeries.Cpu">CPU %</option>
+            <option value="@MetricSeries.Memory">RAM %</option>
+            <option value="@MetricSeries.Disk">Disk %</option>
+            <option value="@MetricSeries.Load">Load</option>
+            <option value="@MetricSeries.NetRx">Network download</option>
+            <option value="@MetricSeries.NetTx">Network upload</option>
+            <option value="@MetricSeries.DiskRead">Disk read</option>
+            <option value="@MetricSeries.DiskWrite">Disk write</option>
+            <option value="@MetricSeries.TcpConnections">TCP connections</option>
+        </select>
+        <TimeRangePicker Selected="@_rangeKey" OnChange="OnRangeAsync" />
+    </div>
+</div>
+
+<TimeChart Title="@($"{_metric} comparison")" Series="_compare" Unit="@UnitOf(_metric)" Loading="_loading" Height="340" ShowSummary="false" Type="line" />
+
+@code {
+    private List<Server> _servers = [];
+    private HashSet<int> _selected = [];
+    private MetricSeries _metric = MetricSeries.Cpu;
+    private string _rangeKey = "1h";
+    private DateTimeOffset _from, _to;
+    private List<Series> _compare = [];
+    private bool _loading;
+    private string _sort = "cpu";
+    private DateTime _lastRender;
+
+    private IEnumerable<ServerLiveState> Sorted
+    {
+        get
+        {
+            var all = Cache.All().Where(s => _servers.Any(x => x.Id == s.ServerId));
+            return _sort switch
+            {
+                "name" => all.OrderBy(s => s.Name),
+                "mem" => all.OrderByDescending(s => s.Sample?.Snapshot.MemPercent ?? -1),
+                "disk" => all.OrderByDescending(s => s.Sample?.Snapshot.DiskPercent ?? -1),
+                _ => all.OrderByDescending(s => s.Sample?.Snapshot.CpuPercent ?? -1)
+            };
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _servers = await Svc.ListAsync();
+        foreach (var s in _servers) Cache.GetOrAdd(s);
+        _selected = _servers.Take(4).Select(s => s.Id).ToHashSet();
+        (_from, _to) = TimeRangePicker.Resolve(_rangeKey);
+        await LoadAsync();
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private async Task ToggleAsync(int id)
+    {
+        if (!_selected.Remove(id)) _selected.Add(id);
+        await LoadAsync();
+    }
+
+    private async Task OnRangeAsync((DateTimeOffset From, DateTimeOffset To, string Key) r)
+    {
+        (_from, _to, _rangeKey) = r;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        if (_loading) return;
+        _loading = true;
+        try { _compare = _selected.Count == 0 ? [] : await Metrics.CompareAsync(_selected, _metric, _from, _to); }
+        finally { _loading = false; }
+    }
+
+    private static string UnitOf(MetricSeries m) => m switch
+    {
+        MetricSeries.Cpu or MetricSeries.Memory or MetricSeries.Disk => "percent",
+        MetricSeries.NetRx or MetricSeries.NetTx => "rate",
+        MetricSeries.DiskRead or MetricSeries.DiskWrite => "bytes",
+        _ => "number"
+    };
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if ((DateTime.UtcNow - _lastRender).TotalSeconds < 2) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

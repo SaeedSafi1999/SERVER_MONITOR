@@ -1,0 +1,152 @@
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject IServerAdapterFactory Adapters
+@inject LiveUpdates Live
+@inject ToastService Toasts
+
+<AuthorizeView Roles="@Roles.Admin">
+    @if (_server is not null)
+    {
+        <div class="glass form-section">
+            <h2>Add monitored service</h2>
+            <div class="d-flex flex-wrap gap-2">
+                <select class="form-select form-select-sm w-auto" @bind="_wellKnown">
+                    <option value="">Well-known services…</option>
+                    @foreach (var (name, display) in Adapters.For(_server).WellKnownServices.Where(w => _server.Services.All(s => s.Name != w.Name)))
+                    {
+                        <option value="@name">@display (@name)</option>
+                    }
+                </select>
+                <button class="btn btn-sm btn-outline-light" disabled="@string.IsNullOrEmpty(_wellKnown)" @onclick="() => AddAsync(_wellKnown, false)">Add</button>
+                <span class="text-secondary small align-self-center mx-2">or custom:</span>
+                <input class="form-control form-control-sm w-auto mono" placeholder="@(_server.IsWindows ? "ServiceName" : "unit-name")" @bind="_custom" maxlength="128" />
+                <button class="btn btn-sm btn-outline-light" disabled="@string.IsNullOrWhiteSpace(_custom)" @onclick="() => AddAsync(_custom, true)">Add custom</button>
+            </div>
+        </div>
+    }
+</AuthorizeView>
+
+<div class="glass table-wrap">
+    @if (_rows is null)
+    {
+        <div class="p-3"><div class="skeleton" style="height:160px"></div></div>
+    }
+    else if (_rows.Count == 0)
+    {
+        <div class="p-4 text-center text-secondary">No services are monitored@(ServerId is null ? "" : " on this server") yet.</div>
+    }
+    else
+    {
+        <table class="table-dark-glass">
+            <thead>
+                <tr>
+                    @if (ServerId is null) { <th>Server</th> }
+                    <th>Service</th><th>State</th><th>Sub-state</th><th>Startup</th><th>Last state change</th><th>Last check</th><th>Error</th><th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var s in _rows)
+                {
+                    <tr @key="s.Id">
+                        @if (ServerId is null) { <td><a href="servers/@s.ServerId">@s.Server?.Name</a></td> }
+                        <td><span class="mono">@s.Name</span>@if (s.IsCustom) { <span class="pill-tag ms-1">custom</span> }<div class="small text-secondary">@s.DisplayName</div></td>
+                        <td><span class="status-badge @Fmt.ServiceClass(s.State)"><span class="dot"></span>@s.State</span></td>
+                        <td class="small">@s.SubState</td>
+                        <td class="small">@s.StartupType</td>
+                        <td class="small">@Fmt.Time(s.LastStateChangeAt)</td>
+                        <td class="small">@Fmt.Ago(s.LastCheckedAt)</td>
+                        <td class="small text-danger text-break" style="max-width:320px">@s.LastError</td>
+                        <td class="text-end text-nowrap">
+                            <AuthorizeView Policy="Operator">
+                                @if (s.Server?.AllowServiceControl == true)
+                                {
+                                    <button class="btn btn-sm btn-outline-warning" disabled="@(_busy == s.Id)" @onclick="() => RestartAsync(s)">
+                                        @if (_busy == s.Id) { <span class="spinner-border spinner-border-sm"></span> } else { <i class="bi bi-arrow-repeat"></i> } Restart
+                                    </button>
+                                }
+                            </AuthorizeView>
+                            <AuthorizeView Roles="@Roles.Admin">
+                                <button class="icon-btn" title="Stop monitoring" @onclick="() => RemoveAsync(s)"><i class="bi bi-trash"></i></button>
+                            </AuthorizeView>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</div>
+
+@code {
+    /// <summary>Null = all servers.</summary>
+    [Parameter] public int? ServerId { get; set; }
+
+    private Server? _server;
+    private List<MonitoredService>? _rows;
+    private string _wellKnown = "", _custom = "";
+    private int? _busy;
+    private DateTime _lastReload;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadAsync();
+        Live.ServerUpdated -= OnUpdate;
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private async Task LoadAsync()
+    {
+        if (ServerId is not null)
+        {
+            _server = await Svc.GetAsync(ServerId.Value);
+            _rows = _server?.Services.OrderBy(s => s.Name).ToList() ?? [];
+            foreach (var r in _rows) r.Server = _server;
+        }
+        else
+        {
+            var list = await Svc.AllServicesAsync();
+            _rows = list.OrderBy(r => r.State == ServiceState.Running).ThenBy(r => r.Server!.Name).ThenBy(r => r.Name).ToList();
+        }
+    }
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if (ServerId is not null && s.ServerId != ServerId) return;
+        if ((DateTime.UtcNow - _lastReload).TotalSeconds < 5) return;
+        _lastReload = DateTime.UtcNow;
+        _ = InvokeAsync(async () => { await LoadAsync(); StateHasChanged(); });
+    }
+
+    private async Task AddAsync(string name, bool custom)
+    {
+        try
+        {
+            var display = Adapters.For(_server!).WellKnownServices.FirstOrDefault(w => w.Name == name).Display;
+            await Svc.AddServiceAsync(ServerId!.Value, name, display, custom);
+            _wellKnown = _custom = "";
+            await LoadAsync();
+            Toasts.Success($"Monitoring {name}");
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task RemoveAsync(MonitoredService s)
+    {
+        try { await Svc.RemoveServiceAsync(s.Id); await LoadAsync(); }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task RestartAsync(MonitoredService s)
+    {
+        _busy = s.Id;
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            var r = await Svc.RestartServiceAsync(s.Id, cts.Token);
+            if (r.Success) Toasts.Success(r.Message); else Toasts.Error(r.Message);
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+        finally { _busy = null; }
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

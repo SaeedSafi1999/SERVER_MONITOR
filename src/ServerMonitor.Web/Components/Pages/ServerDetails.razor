@@ -1,0 +1,478 @@
+@page "/servers/{Id:int}"
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject MetricsQueryService Metrics
+@inject IServerAdapterFactory Adapters
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+@inject ToastService Toasts
+@inject IJSRuntime JS
+@inject ServerMonitor.Infrastructure.Monitoring.ICollectionTrigger Trigger
+
+<PageTitle>@(_server?.Name ?? "Server") · ServerMonitor</PageTitle>
+
+@if (_server is null)
+{
+    <div class="skeleton" style="height:300px"></div>
+}
+else
+{
+    var snap = _live?.Sample?.Snapshot;
+    <div class="page-header">
+        <div>
+            <h1><i class="bi @(_server.IsWindows ? "bi-windows" : "bi-ubuntu") me-2 text-secondary"></i>@_server.Name <StatusBadge Status="_live?.Status ?? _server.Status" /></h1>
+            <div class="sub mono">@_server.Host · @(_live?.OsVersion ?? _server.OsVersion) · @_server.Protocol:@_server.ManagementPort · last data @Fmt.Ago(_live?.LastSeenAt)</div>
+        </div>
+        <div class="actions">
+            <button class="btn btn-sm btn-outline-light" @onclick="RefreshNow"><i class="bi bi-arrow-clockwise me-1"></i>Poll now</button>
+            <a class="btn btn-sm btn-outline-light" href="logs?server=@Id"><i class="bi bi-terminal me-1"></i>Logs</a>
+            <AuthorizeView Roles="@Roles.Admin"><a class="btn btn-sm btn-outline-light" href="servers/@Id/edit"><i class="bi bi-pencil me-1"></i>Edit</a></AuthorizeView>
+        </div>
+    </div>
+
+    @if (_live?.ConnectionState is not (null or ConnectionState.Connected) && _live?.LastError is not null)
+    {
+        <div class="alert alert-warning glass py-2 small"><i class="bi bi-exclamation-triangle me-2"></i><b>@_live.ConnectionState:</b> @_live.LastError</div>
+    }
+
+    <div class="tabs">
+        @foreach (var (key, label) in Tabs)
+        {
+            <button class="tab @(_tab == key ? "active" : "")" @onclick="() => SelectTabAsync(key)">@label</button>
+        }
+    </div>
+
+    @switch (_tab)
+    {
+        case "overview":
+            <div class="stat-grid">
+                <StatCard Label="CPU" Value="@Fmt.Pct(snap?.CpuPercent)" Sub="@($"{snap?.CpuCores} cores · {Fmt.Num(snap?.CpuFrequencyMhz, "0")} MHz")" Icon="bi-cpu" Kind="@Fmt.LevelClass(snap?.CpuPercent, 75, 90)" />
+                <StatCard Label="Memory" Value="@Fmt.Pct(snap?.MemPercent)" Sub="@($"{Fmt.Bytes(snap?.MemUsed)} / {Fmt.Bytes(snap?.MemTotal)}")" Icon="bi-memory" Kind="@Fmt.LevelClass(snap?.MemPercent, 80, 90)" />
+                <StatCard Label="Disk" Value="@Fmt.Pct(snap?.DiskPercent)" Sub="@($"{Fmt.Bytes(snap?.DiskUsed)} / {Fmt.Bytes(snap?.DiskTotal)}")" Icon="bi-device-hdd" Kind="@Fmt.LevelClass(snap?.DiskPercent, 80, 90)" />
+                <StatCard Label="Load (1/5/15)" Value="@($"{Fmt.Num(snap?.Load1)} / {Fmt.Num(snap?.Load5)} / {Fmt.Num(snap?.Load15)}")" Sub="@(_server.IsWindows ? "processor queue length" : "run-queue average")" Icon="bi-bar-chart" />
+                <StatCard Label="Network" Value="@($"↓ {Fmt.Rate(snap?.NetRxBytesPerSec)}")" Sub="@($"↑ {Fmt.Rate(snap?.NetTxBytesPerSec)}")" Icon="bi-hdd-network" />
+                <StatCard Label="Ping (ICMP)" Value="@Fmt.Ms(_live?.Icmp?.AvgMs)" Sub="@($"loss {Fmt.Pct(_live?.Icmp?.PacketLossPercent)} · jitter {Fmt.Ms(_live?.Icmp?.JitterMs)}")" Icon="bi-broadcast" />
+                <StatCard Label="HTTP response" Value="@Fmt.Ms(_live?.Http?.TotalMs)" Sub="@(_live?.Http is null ? "no health URL" : $"TTFB {Fmt.Ms(_live.Http.TtfbMs)} · HTTP {_live.Http.StatusCode}")" Icon="bi-globe" />
+                <StatCard Label="Uptime" Value="@Fmt.Uptime(snap?.UptimeSeconds ?? 0)" Sub="@($"{snap?.ProcessCount} processes · {snap?.ThreadCount} threads")" Icon="bi-clock-history" />
+                <StatCard Label="TCP" Value="@($"{snap?.TcpEstablished ?? 0} est.")" Sub="@($"{snap?.TcpConnections ?? 0} total · {snap?.ActiveSessions ?? 0} sessions")" Icon="bi-diagram-2" />
+                <StatCard Label="Open handles / FDs" Value="@Fmt.Num(snap?.OpenFileDescriptors, "0")" Sub="@(snap?.CpuTemperatureC is null ? "temperature n/a" : $"CPU temp {snap.CpuTemperatureC:0.#} °C")" Icon="bi-file-earmark-binary" />
+            </div>
+
+            @if (_live?.Sample is { } sample)
+            {
+                <div class="row g-3 mb-3">
+                    <div class="col-xl-6">
+                        <div class="glass p-3 h-100">
+                            <div class="chart-title mb-2">Per-core usage</div>
+                            <div class="d-grid gap-2" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr))">
+                                @for (var i = 0; i < sample.PerCoreUsage.Length; i++)
+                                {
+                                    <MeterBar Label="@($"core {i}")" Value="sample.PerCoreUsage[i]" />
+                                }
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-xl-6">
+                        <div class="glass p-3 h-100">
+                            <div class="chart-title mb-2">Memory &amp; swap</div>
+                            <dl class="kv">
+                                <dt>Total</dt><dd>@Fmt.Bytes(snap!.MemTotal)</dd>
+                                <dt>Used</dt><dd>@Fmt.Bytes(snap.MemUsed) (@Fmt.Pct(snap.MemPercent))</dd>
+                                <dt>Free</dt><dd>@Fmt.Bytes(snap.MemFree)</dd>
+                                <dt>Available</dt><dd>@Fmt.Bytes(snap.MemAvailable)</dd>
+                                <dt>@(_server.IsWindows ? "Page file" : "Swap")</dt><dd>@Fmt.Bytes(snap.SwapUsed) / @Fmt.Bytes(snap.SwapTotal) (@Fmt.Pct(snap.SwapPercent))</dd>
+                                <dt>Disk I/O</dt><dd>read @Fmt.Bytes(snap.DiskReadBytesPerSec)/s · write @Fmt.Bytes(snap.DiskWriteBytesPerSec)/s</dd>
+                                <dt>Disk latency</dt><dd>read @Fmt.Ms(snap.DiskReadLatencyMs) · write @Fmt.Ms(snap.DiskWriteLatencyMs)</dd>
+                            </dl>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row g-3 mb-3">
+                    <div class="col-xl-6">
+                        <div class="glass table-wrap h-100">
+                            <div class="chart-title px-3 pt-2">Partitions</div>
+                            <table class="table-dark-glass">
+                                <thead><tr><th>Mount</th><th>Device</th><th>FS</th><th>Size</th><th>Used</th><th>Free</th><th style="width:140px">Usage</th></tr></thead>
+                                <tbody>
+                                    @foreach (var p in sample.Partitions)
+                                    {
+                                        <tr><td class="mono">@p.Mount</td><td class="mono small">@p.Device</td><td>@p.FileSystem</td><td>@Fmt.Bytes(p.TotalBytes)</td><td>@Fmt.Bytes(p.UsedBytes)</td><td>@Fmt.Bytes(p.FreeBytes)</td>
+                                            <td><MeterBar Value="p.UsedPercent" /></td></tr>
+                                    }
+                                </tbody>
+                            </table>
+                            @if (sample.DiskDevices.Count > 0)
+                            {
+                                <table class="table-dark-glass mt-2">
+                                    <thead><tr><th>Disk</th><th>Read/s</th><th>Write/s</th><th>Read latency</th><th>Write latency</th></tr></thead>
+                                    <tbody>
+                                        @foreach (var d in sample.DiskDevices)
+                                        {
+                                            <tr><td class="mono">@d.Device</td><td>@Fmt.Bytes(d.ReadBytesPerSec)</td><td>@Fmt.Bytes(d.WriteBytesPerSec)</td><td>@Fmt.Ms(d.ReadLatencyMs)</td><td>@Fmt.Ms(d.WriteLatencyMs)</td></tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            }
+                        </div>
+                    </div>
+                    <div class="col-xl-6">
+                        <div class="glass table-wrap h-100">
+                            <div class="chart-title px-3 pt-2">Network interfaces</div>
+                            <table class="table-dark-glass">
+                                <thead><tr><th>Interface</th><th>State</th><th>↓ Rate</th><th>↑ Rate</th><th>Rx total</th><th>Tx total</th><th>Errors</th><th>Drops</th></tr></thead>
+                                <tbody>
+                                    @foreach (var n in sample.Interfaces)
+                                    {
+                                        <tr>
+                                            <td class="mono">@n.Name @if (n.SpeedMbps is not null) { <span class="small text-secondary">@n.SpeedMbps Mb/s</span> }</td>
+                                            <td><span class="status-badge @(n.IsUp ? "healthy" : "offline")"><span class="dot"></span>@(n.IsUp ? "up" : "down")</span></td>
+                                            <td>@Fmt.Rate(n.RxBytesPerSec)</td><td>@Fmt.Rate(n.TxBytesPerSec)</td>
+                                            <td>@Fmt.Bytes(n.RxBytes)</td><td>@Fmt.Bytes(n.TxBytes)</td>
+                                            <td class="@(n.RxErrors + n.TxErrors > 0 ? "text-warning" : "")">@(n.RxErrors + n.TxErrors)</td>
+                                            <td>@(n.RxDrops + n.TxDrops)</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                            <div class="px-3 py-2 small text-secondary">
+                                TCP states:
+                                @foreach (var kv in sample.TcpStates.OrderByDescending(k => k.Value)) { <span class="pill-tag">@kv.Key @kv.Value</span> }
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+            break;
+
+        case "performance":
+            <div class="d-flex flex-wrap gap-2 align-items-center mb-3 no-print">
+                <TimeRangePicker Selected="@_rangeKey" OnChange="OnRangeAsync" />
+                <div class="ms-auto d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-light" @onclick="ExportMetricsAsync"><i class="bi bi-filetype-csv me-1"></i>CSV</button>
+                    <button class="btn btn-sm btn-outline-light" @onclick='() => JS.InvokeVoidAsync("smPrint")'><i class="bi bi-filetype-pdf me-1"></i>PDF</button>
+                </div>
+            </div>
+            <div class="chart-grid">
+                <TimeChart Title="CPU usage" Unit="percent" Max="100" Series="S(MetricSeries.Cpu)" Loading="_chartsLoading" />
+                <TimeChart Title="Memory usage" Unit="percent" Max="100" Series="S(MetricSeries.Memory, MetricSeries.Swap)" Loading="_chartsLoading" />
+                <TimeChart Title="Disk usage" Unit="percent" Max="100" Series="S(MetricSeries.Disk)" Loading="_chartsLoading" />
+                <TimeChart Title="Network traffic" Unit="rate" Series="S(MetricSeries.NetRx, MetricSeries.NetTx)" Loading="_chartsLoading" />
+                <TimeChart Title="Disk I/O" Unit="bytes" Series="S(MetricSeries.DiskRead, MetricSeries.DiskWrite)" Loading="_chartsLoading" />
+                <TimeChart Title="@(_server.IsWindows ? "Processor queue" : "Load average (1m)")" Unit="number" Series="S(MetricSeries.Load)" Loading="_chartsLoading" />
+                <TimeChart Title="TCP connections" Unit="number" Series="S(MetricSeries.TcpConnections)" Loading="_chartsLoading" Type="line" />
+                <TimeChart Title="Processes" Unit="number" Series="S(MetricSeries.Processes)" Loading="_chartsLoading" Type="line" />
+            </div>
+            break;
+
+        case "latency":
+            <div class="d-flex flex-wrap gap-2 align-items-center mb-3 no-print">
+                <TimeRangePicker Selected="@_rangeKey" OnChange="OnRangeAsync" />
+                <button class="btn btn-sm btn-outline-light ms-auto" @onclick="ExportProbesAsync"><i class="bi bi-filetype-csv me-1"></i>Probe CSV</button>
+            </div>
+            <div class="glass table-wrap mb-3">
+                <table class="table-dark-glass">
+                    <thead><tr><th>Method</th><th>Current</th><th>Min</th><th>Avg</th><th>Max</th><th>P50</th><th>P90</th><th>P95</th><th>P99</th><th>Jitter</th><th>Loss</th><th>Samples</th></tr></thead>
+                    <tbody>
+                        @foreach (var (name, st) in new[] { ("ICMP ping", _icmpStats), ("TCP connect", _tcpStats), ("HTTP total", _httpPhases?.Total) })
+                        {
+                            if (st is null) continue;
+                            <tr>
+                                <td>@name</td><td>@Fmt.Ms(st.Current)</td><td>@Fmt.Ms(st.Min)</td><td>@Fmt.Ms(st.Average)</td><td>@Fmt.Ms(st.Max)</td>
+                                <td>@Fmt.Ms(st.P50)</td><td>@Fmt.Ms(st.P90)</td><td>@Fmt.Ms(st.P95)</td><td>@Fmt.Ms(st.P99)</td><td>@Fmt.Ms(st.Jitter)</td>
+                                <td class="@(st.PacketLossPercent > 0 ? "text-warning" : "")">@Fmt.Pct(st.PacketLossPercent)</td><td>@st.Samples</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+            @if (_httpPhases is { Attempts: > 0 } hp)
+            {
+                <div class="glass table-wrap mb-3">
+                    <div class="chart-title px-3 pt-2">HTTP phases (@hp.Attempts attempts, @hp.Failures failed) — @_server.HealthCheckUrl</div>
+                    <table class="table-dark-glass">
+                        <thead><tr><th>Phase</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th></tr></thead>
+                        <tbody>
+                            @foreach (var (name, st) in new[] { ("DNS resolution", hp.Dns), ("TCP connect", hp.Tcp), ("TLS handshake", hp.Tls), ("Time to first byte", hp.Ttfb), ("Total response", hp.Total) })
+                            {
+                                <tr><td>@name</td><td>@Fmt.Ms(st.Min)</td><td>@Fmt.Ms(st.Average)</td><td>@Fmt.Ms(st.P50)</td><td>@Fmt.Ms(st.P95)</td><td>@Fmt.Ms(st.P99)</td><td>@Fmt.Ms(st.Max)</td></tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+            <div class="chart-grid">
+                <TimeChart Title="Ping latency (ICMP)" Unit="ms" Series="L(_icmpSeries)" Loading="_chartsLoading" />
+                <TimeChart Title="Packet loss" Unit="percent" Max="100" Series="L(_lossSeries)" Loading="_chartsLoading" Type="line" />
+                <TimeChart Title="TCP connect time" Unit="ms" Series="L(_tcpSeries)" Loading="_chartsLoading" />
+                <TimeChart Title="HTTP response time" Unit="ms" Series="L(_httpSeries)" Loading="_chartsLoading" />
+            </div>
+            break;
+
+        case "processes":
+            <div class="d-flex gap-2 align-items-center mb-3">
+                <span class="text-secondary small">CPU measured over a 1-second window on the host. Refreshes every 10 s while this tab is open.</span>
+                <button class="btn btn-sm btn-outline-light ms-auto" @onclick="LoadProcessesAsync" disabled="@_procLoading"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</button>
+            </div>
+            <div class="glass table-wrap" style="max-height:70vh">
+                @if (_processes is null)
+                {
+                    <div class="p-3"><div class="skeleton" style="height:300px"></div></div>
+                }
+                else
+                {
+                    <table class="table-dark-glass">
+                        <thead>
+                            <tr>
+                                <th class="sortable" @onclick='() => SortProc("pid")'>PID</th>
+                                <th class="sortable" @onclick='() => SortProc("name")'>Name</th>
+                                <th>User</th>
+                                <th class="sortable" @onclick='() => SortProc("cpu")'>CPU % @(_procSort == "cpu" ? "▼" : "")</th>
+                                <th class="sortable" @onclick='() => SortProc("mem")'>Memory @(_procSort == "mem" ? "▼" : "")</th>
+                                <th class="sortable" @onclick='() => SortProc("threads")'>Threads</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var p in SortedProcesses)
+                            {
+                                <tr><td class="mono">@p.Pid</td><td class="mono">@p.Name</td><td>@p.User</td><td>@p.CpuPercent.ToString("0.0")</td><td>@Fmt.Bytes(p.RssBytes) <span class="text-secondary small">(@p.MemPercent.ToString("0.0")%)</span></td><td>@p.Threads</td></tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+            break;
+
+        case "services":
+            <ServiceTable ServerId="Id" />
+            break;
+
+        case "ports":
+            <PortTable ServerId="Id" />
+            break;
+
+        case "security":
+            <SecurityPanel ServerId="Id" />
+            break;
+
+        case "availability":
+            <div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+                @foreach (var (k, label, days) in new[] { ("1d", "Day", 1), ("7d", "Week", 7), ("30d", "Month", 30), ("90d", "Quarter", 90) })
+                {
+                    <button class="chip @(_availKey == k ? "active" : "")" @onclick="() => LoadAvailabilityAsync(k, days)">@label</button>
+                }
+            </div>
+            @if (_avail is { } a)
+            {
+                <div class="stat-grid">
+                    <StatCard Label="Uptime" Value="@($"{a.UptimePercent:0.000}%")" Sub="@($"SLA target {a.SlaTarget}%")" Icon="bi-check2-all" Kind="@(a.SlaMet ? "healthy" : "critical")" />
+                    <StatCard Label="Downtime" Value="@Fmt.Duration(a.Downtime)" Sub="@($"{a.Incidents} incident(s)")" Icon="bi-x-octagon" Kind="@(a.Downtime > TimeSpan.Zero ? "warning" : "")" />
+                    <StatCard Label="MTTR" Value="@Fmt.Duration(a.Mttr)" Sub="mean time to recovery" Icon="bi-tools" />
+                    <StatCard Label="MTBF" Value="@Fmt.Duration(a.Mtbf)" Sub="mean time between failures" Icon="bi-hourglass-split" />
+                    <StatCard Label="Error budget left" Value="@Fmt.Duration(a.ErrorBudgetRemaining < TimeSpan.Zero ? TimeSpan.Zero : a.ErrorBudgetRemaining)" Sub="@(a.ErrorBudgetRemaining < TimeSpan.Zero ? "budget exceeded" : "within SLA")" Icon="bi-piggy-bank" Kind="@(a.ErrorBudgetRemaining < TimeSpan.Zero ? "critical" : "healthy")" />
+                    <StatCard Label="Not monitored" Value="@Fmt.Duration(a.Unknown)" Sub="excluded from uptime %" Icon="bi-question-circle" />
+                </div>
+                <div class="glass p-3 mb-3">
+                    <div class="chart-title mb-2">Availability timeline</div>
+                    <div class="avail-bar">
+                        @{ var total = (a.To > DateTimeOffset.UtcNow ? DateTimeOffset.UtcNow : a.To) - a.From; }
+                        @foreach (var seg in _segments)
+                        {
+                            var w = total.TotalSeconds > 0 ? 100.0 * (seg.To - seg.From).TotalSeconds / total.TotalSeconds : 0;
+                            <div class="@(seg.IsUp == true ? "up" : "down")" style="width:@(w.ToString(System.Globalization.CultureInfo.InvariantCulture))%" title="@Fmt.Time(seg.From) → @Fmt.Time(seg.To): @(seg.IsUp == true ? "up" : "down")"></div>
+                        }
+                    </div>
+                    <div class="d-flex justify-content-between small text-secondary mt-1"><span>@Fmt.Time(a.From)</span><span>now</span></div>
+                </div>
+                <div class="glass table-wrap">
+                    <table class="table-dark-glass">
+                        <thead><tr><th>From</th><th>To</th><th>State</th><th>Duration</th></tr></thead>
+                        <tbody>
+                            @foreach (var seg in _segments.Where(s => s.IsUp == false).OrderByDescending(s => s.From))
+                            {
+                                <tr><td>@Fmt.Time(seg.From)</td><td>@Fmt.Time(seg.To)</td><td><span class="status-badge critical"><span class="dot"></span>down</span></td><td>@Fmt.Duration(seg.To - seg.From)</td></tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+            break;
+    }
+}
+
+@code {
+    [Parameter] public int Id { get; set; }
+
+    private static readonly (string Key, string Label)[] Tabs =
+    [
+        ("overview", "Overview"), ("performance", "Performance"), ("latency", "Latency & response"), ("processes", "Processes"),
+        ("services", "Services"), ("ports", "Ports"), ("security", "Security"), ("availability", "Availability / SLA")
+    ];
+
+    private Server? _server;
+    private ServerLiveState? _live;
+    private string _tab = "overview";
+    private string _rangeKey = "1h";
+    private DateTimeOffset _from, _to;
+    private bool _chartsLoading = true;
+    private Dictionary<MetricSeries, Series> _series = [];
+    private Series? _icmpSeries, _lossSeries, _tcpSeries, _httpSeries;
+    private LatencyStats? _icmpStats, _tcpStats;
+    private HttpPhaseStats? _httpPhases;
+    private IReadOnlyList<ProcessInfo>? _processes;
+    private bool _procLoading;
+    private string _procSort = "cpu";
+    private Timer? _procTimer, _chartTimer;
+    private AvailabilityReport? _avail;
+    private List<AvailabilitySegment> _segments = [];
+    private string _availKey = "7d";
+    private DateTime _lastRender;
+    private readonly CancellationTokenSource _cts = new();
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _server = await Svc.GetAsync(Id);
+        if (_server is null) return;
+        _live = Cache.GetOrAdd(_server);
+        (_from, _to) = TimeRangePicker.Resolve(_rangeKey);
+        Live.ServerUpdated -= OnUpdate;
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if (s.ServerId != Id) return;
+        _live = s;
+        if (_tab != "overview" || (DateTime.UtcNow - _lastRender).TotalMilliseconds < 500) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private async Task SelectTabAsync(string key)
+    {
+        _tab = key;
+        _procTimer?.Dispose();
+        _chartTimer?.Dispose();
+        switch (key)
+        {
+            case "performance":
+            case "latency":
+                await LoadChartsAsync();
+                // Short ranges are live: re-query every 15 s so new samples appear.
+                if (_rangeKey is "5m" or "15m" or "1h")
+                    _chartTimer = new Timer(_ => InvokeAsync(async () => { (_from, _to) = TimeRangePicker.Resolve(_rangeKey); await LoadChartsAsync(silent: true); StateHasChanged(); }), null, 15000, 15000);
+                break;
+            case "processes":
+                await LoadProcessesAsync();
+                _procTimer = new Timer(_ => InvokeAsync(async () => { await LoadProcessesAsync(); StateHasChanged(); }), null, 10000, 10000);
+                break;
+            case "availability":
+                await LoadAvailabilityAsync(_availKey, _availKey switch { "1d" => 1, "30d" => 30, "90d" => 90, _ => 7 });
+                break;
+        }
+    }
+
+    private async Task OnRangeAsync((DateTimeOffset From, DateTimeOffset To, string Key) r)
+    {
+        (_from, _to, _rangeKey) = r;
+        await SelectTabAsync(_tab);
+    }
+
+    private bool _chartBusy;
+
+    private async Task LoadChartsAsync(bool silent = false)
+    {
+        // The query service owns one DbContext: never run two loads at once.
+        if (_chartBusy) return;
+        _chartBusy = true;
+        if (!silent) _chartsLoading = true;
+        StateHasChanged();
+        try
+        {
+            if (_tab == "performance")
+                _series = await Metrics.MetricSeriesAsync(Id, _from, _to, Enum.GetValues<MetricSeries>(), ct: _cts.Token);
+            else
+            {
+                var icmp = await Metrics.LatencyAsync(Id, ProbeType.Icmp, _from, _to, _cts.Token);
+                (_icmpSeries, _lossSeries, _icmpStats) = icmp;
+                var tcp = await Metrics.LatencyAsync(Id, ProbeType.Tcp, _from, _to, _cts.Token);
+                (_tcpSeries, _, _tcpStats) = tcp;
+                var http = await Metrics.LatencyAsync(Id, ProbeType.Http, _from, _to, _cts.Token);
+                _httpSeries = http.Series;
+                _httpPhases = await Metrics.HttpPhasesAsync(Id, _from, _to, _cts.Token);
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally { _chartBusy = false; }
+        _chartsLoading = false;
+    }
+
+    private IReadOnlyList<Series> S(params MetricSeries[] which) =>
+        which.Where(_series.ContainsKey).Select(w => _series[w] with { Name = w switch
+        {
+            MetricSeries.NetRx => "Download", MetricSeries.NetTx => "Upload", MetricSeries.DiskRead => "Read", MetricSeries.DiskWrite => "Write",
+            MetricSeries.Swap => _server!.IsWindows ? "Page file" : "Swap", MetricSeries.Memory => "RAM", _ => w.ToString()
+        } }).ToList();
+
+    private static IReadOnlyList<Series> L(Series? s) => s is null ? [] : [s];
+
+    private async Task LoadProcessesAsync()
+    {
+        if (_server is null || _procLoading) return;
+        _procLoading = true;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            cts.CancelAfter(TimeSpan.FromSeconds(45));
+            _processes = await Adapters.For(_server).GetProcessesAsync(_server, 300, cts.Token);
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested) { }
+        catch (Exception ex) { Toasts.Error("Process list failed: " + ex.Message); _processes ??= []; }
+        finally { _procLoading = false; }
+    }
+
+    private void SortProc(string key) => _procSort = key;
+
+    private IEnumerable<ProcessInfo> SortedProcesses => _procSort switch
+    {
+        "mem" => _processes!.OrderByDescending(p => p.RssBytes),
+        "pid" => _processes!.OrderBy(p => p.Pid),
+        "name" => _processes!.OrderBy(p => p.Name),
+        "threads" => _processes!.OrderByDescending(p => p.Threads),
+        _ => _processes!.OrderByDescending(p => p.CpuPercent)
+    };
+
+    private async Task LoadAvailabilityAsync(string key, int days)
+    {
+        _availKey = key;
+        var to = DateTimeOffset.UtcNow;
+        (_avail, _segments) = await Metrics.AvailabilityAsync(Id, to.AddDays(-days), to);
+    }
+
+    private void RefreshNow()
+    {
+        Trigger.RequestImmediate(Id);
+        Toasts.Info("Poll requested.");
+    }
+
+    private async Task ExportMetricsAsync()
+    {
+        var csv = await Metrics.ExportMetricsCsvAsync(Id, _from, _to);
+        await JS.InvokeVoidAsync("smDownload", $"{_server!.Name}-metrics-{_from:yyyyMMddHHmm}-{_to:yyyyMMddHHmm}.csv", "text/csv", csv);
+    }
+
+    private async Task ExportProbesAsync()
+    {
+        var csv = await Metrics.ExportProbesCsvAsync(Id, _from, _to);
+        await JS.InvokeVoidAsync("smDownload", $"{_server!.Name}-probes-{_from:yyyyMMddHHmm}-{_to:yyyyMMddHHmm}.csv", "text/csv", csv);
+    }
+
+    public void Dispose()
+    {
+        Live.ServerUpdated -= OnUpdate;
+        _procTimer?.Dispose();
+        _chartTimer?.Dispose();
+        _cts.Cancel();
+        _cts.Dispose();
+    }
+}

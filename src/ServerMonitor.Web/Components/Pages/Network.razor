@@ -1,0 +1,123 @@
+@page "/network"
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject MetricsQueryService Metrics
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+
+<PageTitle>Network · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Network &amp; latency</h1>
+        <div class="sub">ICMP, TCP-connect and HTTP are measured independently from the monitoring host</div>
+    </div>
+    <div class="actions"><TimeRangePicker Selected="@_rangeKey" OnChange="OnRangeAsync" /></div>
+</div>
+
+<div class="glass table-wrap mb-4">
+    <div class="chart-title px-3 pt-2">Live</div>
+    <table class="table-dark-glass">
+        <thead>
+            <tr><th>Server</th><th>Ping avg</th><th>Ping min/max</th><th>Jitter</th><th>Loss</th><th>TCP connect</th><th>HTTP total</th><th>DNS</th><th>TLS</th><th>TTFB</th><th>HTTP</th><th>↓ / ↑</th><th>Net errors</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var s in Cache.All().Where(x => _ids.Contains(x.ServerId)))
+            {
+                <tr>
+                    <td><a href="servers/@s.ServerId">@s.Name</a></td>
+                    <td>@Fmt.Ms(s.Icmp?.AvgMs)</td>
+                    <td class="small">@Fmt.Ms(s.Icmp?.MinMs) / @Fmt.Ms(s.Icmp?.MaxMs)</td>
+                    <td>@Fmt.Ms(s.Icmp?.JitterMs)</td>
+                    <td class="@(s.Icmp?.PacketLossPercent > 0 ? "text-warning" : "")">@Fmt.Pct(s.Icmp?.PacketLossPercent)</td>
+                    <td>@Fmt.Ms(s.Tcp?.CurrentMs)</td>
+                    <td>@Fmt.Ms(s.Http?.TotalMs)</td>
+                    <td class="small">@Fmt.Ms(s.Http?.DnsMs)</td>
+                    <td class="small">@Fmt.Ms(s.Http?.TlsHandshakeMs)</td>
+                    <td class="small">@Fmt.Ms(s.Http?.TtfbMs)</td>
+                    <td>@(s.Http?.StatusCode?.ToString() ?? (s.Http?.Error ?? "—"))</td>
+                    <td class="small">@Fmt.Rate(s.Sample?.Snapshot.NetRxBytesPerSec) / @Fmt.Rate(s.Sample?.Snapshot.NetTxBytesPerSec)</td>
+                    <td>@(s.Sample?.Snapshot.NetErrors)</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+<div class="glass table-wrap">
+    <div class="chart-title px-3 pt-2">Statistics for selected range (ICMP)</div>
+    @if (_loading)
+    {
+        <div class="p-3"><div class="skeleton" style="height:120px"></div></div>
+    }
+    else
+    {
+        <table class="table-dark-glass">
+            <thead><tr><th>Server</th><th>Min</th><th>Avg</th><th>Max</th><th>P50</th><th>P90</th><th>P95</th><th>P99</th><th>Jitter</th><th>Loss</th><th>TCP P95</th><th>HTTP P95</th></tr></thead>
+            <tbody>
+                @foreach (var r in _rows)
+                {
+                    <tr>
+                        <td><a href="servers/@r.Id">@r.Name</a></td>
+                        <td>@Fmt.Ms(r.Icmp.Min)</td><td>@Fmt.Ms(r.Icmp.Average)</td><td>@Fmt.Ms(r.Icmp.Max)</td>
+                        <td>@Fmt.Ms(r.Icmp.P50)</td><td>@Fmt.Ms(r.Icmp.P90)</td><td>@Fmt.Ms(r.Icmp.P95)</td><td>@Fmt.Ms(r.Icmp.P99)</td>
+                        <td>@Fmt.Ms(r.Icmp.Jitter)</td><td>@Fmt.Pct(r.Icmp.PacketLossPercent)</td>
+                        <td>@Fmt.Ms(r.Tcp.P95)</td><td>@Fmt.Ms(r.Http.P95)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</div>
+
+@code {
+    private sealed record Row(int Id, string Name, LatencyStats Icmp, LatencyStats Tcp, LatencyStats Http);
+
+    private HashSet<int> _ids = [];
+    private List<Server> _servers = [];
+    private List<Row> _rows = [];
+    private string _rangeKey = "1h";
+    private DateTimeOffset _from, _to;
+    private bool _loading = true;
+    private DateTime _lastRender;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _servers = await Svc.ListAsync();
+        foreach (var s in _servers) Cache.GetOrAdd(s);
+        _ids = _servers.Select(s => s.Id).ToHashSet();
+        (_from, _to) = TimeRangePicker.Resolve(_rangeKey);
+        await LoadAsync();
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private async Task OnRangeAsync((DateTimeOffset From, DateTimeOffset To, string Key) r)
+    {
+        (_from, _to, _rangeKey) = r;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        var rows = new List<Row>();
+        foreach (var s in _servers)
+        {
+            var icmp = await Metrics.LatencyAsync(s.Id, ProbeType.Icmp, _from, _to);
+            var tcp = await Metrics.LatencyAsync(s.Id, ProbeType.Tcp, _from, _to);
+            var http = await Metrics.LatencyAsync(s.Id, ProbeType.Http, _from, _to);
+            rows.Add(new Row(s.Id, s.Name, icmp.Stats, tcp.Stats, http.Stats));
+        }
+        _rows = rows;
+        _loading = false;
+    }
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if ((DateTime.UtcNow - _lastRender).TotalSeconds < 2) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

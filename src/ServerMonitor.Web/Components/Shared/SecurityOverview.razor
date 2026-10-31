@@ -1,0 +1,57 @@
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+
+<div class="glass table-wrap mb-3">
+    <table class="table-dark-glass">
+        <thead>
+            <tr><th>Server</th><th>Failed logins</th><th>Successful logins</th><th>Firewall</th><th>Listening ports</th><th>Updates (security)</th><th>Reboot</th><th>Encryption</th><th>TLS certificate</th><th>Last scan</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var s in _servers)
+            {
+                var sec = Cache.Get(s.Id)?.Security;
+                var days = s.CertificateNotAfter is { } na ? (na - DateTimeOffset.UtcNow).TotalDays : (double?)null;
+                <tr>
+                    <td><a href="servers/@s.Id">@s.Name</a></td>
+                    <td class="@(sec?.FailedLogins.Count > 0 ? "text-warning" : "")">@(sec?.FailedLogins.Count.ToString() ?? "—")</td>
+                    <td>@(sec?.SuccessfulLogins.Count.ToString() ?? "—")</td>
+                    <td>
+                        @if (sec?.FirewallActive == true) { <span class="status-badge healthy"><span class="dot"></span>active</span> }
+                        else if (sec?.FirewallActive == false) { <span class="status-badge critical"><span class="dot"></span>inactive</span> }
+                        else { <span class="text-secondary">—</span> }
+                    </td>
+                    <td>@(sec?.ListeningPorts.Count.ToString() ?? "—")</td>
+                    <td>@(sec?.PendingUpdates?.ToString() ?? "—") <span class="text-secondary">(@(sec?.PendingSecurityUpdates?.ToString() ?? "?"))</span></td>
+                    <td>@(sec?.RebootRequired == true ? "required" : sec is null ? "—" : "no")</td>
+                    <td class="small">@sec?.DiskEncryption</td>
+                    <td class="@(days < 14 || s.CertificateValid == false ? "text-danger" : days < 30 ? "text-warning" : "")">
+                        @(days is null ? "—" : $"{days:0} days left")@(s.CertificateValid == false ? " (invalid)" : "")
+                    </td>
+                    <td class="small">@Fmt.Ago(sec?.ScannedAt)</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private List<Server> _servers = [];
+    private DateTime _lastRender;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _servers = await Svc.ListAsync();
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if ((DateTime.UtcNow - _lastRender).TotalSeconds < 5) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

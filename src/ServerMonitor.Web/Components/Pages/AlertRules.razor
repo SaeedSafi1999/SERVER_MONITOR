@@ -1,0 +1,149 @@
+@page "/alerts/rules"
+@attribute [Authorize(Roles = Roles.Admin)]
+@inject AlertManagementService Svc
+@inject ServerManagementService Servers
+@inject ToastService Toasts
+
+<PageTitle>Alert rules · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Alert rules</h1>
+        <div class="sub">Global rules apply to every server; a server-specific rule replaces the global rules for the same metric.</div>
+    </div>
+    <div class="actions">
+        <button class="btn btn-sm btn-primary" @onclick="New"><i class="bi bi-plus-lg me-1"></i>New rule</button>
+    </div>
+</div>
+
+@if (_edit is not null)
+{
+    <div class="glass form-section">
+        <h2>@(_edit.Id == 0 ? "New rule" : "Edit rule")</h2>
+        <div class="row g-3">
+            <div class="col-md-3"><label class="form-label small">Name</label><input class="form-control" @bind="_edit.Name" maxlength="128" /></div>
+            <div class="col-md-3">
+                <label class="form-label small">Scope</label>
+                <select class="form-select" @bind="_scope">
+                    <option value="0">All servers (global)</option>
+                    @foreach (var s in _servers) { <option value="@s.Id">@s.Name</option> }
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small">Metric</label>
+                <select class="form-select" @bind="_edit.Metric">
+                    @foreach (var m in Enum.GetValues<AlertMetric>()) { <option value="@m">@m</option> }
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small">Severity</label>
+                <select class="form-select" @bind="_edit.Severity">
+                    @foreach (var s in Enum.GetValues<AlertSeverity>()) { <option value="@s">@s</option> }
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label small">Operator</label>
+                <select class="form-select" @bind="_edit.Operator">
+                    <option value="@ComparisonOperator.GreaterThan">&gt;</option>
+                    <option value="@ComparisonOperator.GreaterThanOrEqual">≥</option>
+                    <option value="@ComparisonOperator.LessThan">&lt;</option>
+                    <option value="@ComparisonOperator.LessThanOrEqual">≤</option>
+                </select>
+            </div>
+            <div class="col-md-2"><label class="form-label small">Threshold</label><input type="number" step="any" class="form-control" @bind="_edit.Threshold" /></div>
+            <div class="col-md-3"><label class="form-label small">Consecutive breaches before firing</label><input type="number" min="1" max="100" class="form-control" @bind="_edit.ConsecutiveBreaches" /></div>
+            <div class="col-md-3"><label class="form-label small">Notification cooldown (minutes)</label><input type="number" min="0" class="form-control" @bind="_edit.CooldownMinutes" /></div>
+            <div class="col-md-2 d-flex align-items-end">
+                <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="en" @bind="_edit.IsEnabled" /><label class="form-check-label small" for="en">Enabled</label></div>
+            </div>
+            <div class="col-12 small text-secondary">
+                Boolean metrics (ServerOffline, ServiceStopped, PortClosed) report 1 when the condition is true: use "&gt; 0".
+                CertificateExpiryDays is the number of days left: use "&lt; 14".
+            </div>
+        </div>
+        <div class="d-flex justify-content-end gap-2 mt-3">
+            <button class="btn btn-sm btn-outline-light" @onclick="() => _edit = null">Cancel</button>
+            <button class="btn btn-sm btn-primary" @onclick="SaveAsync">Save</button>
+        </div>
+    </div>
+}
+
+<div class="glass table-wrap">
+    <table class="table-dark-glass">
+        <thead><tr><th>Enabled</th><th>Name</th><th>Scope</th><th>Condition</th><th>Severity</th><th>Breaches</th><th>Cooldown</th><th></th></tr></thead>
+        <tbody>
+            @foreach (var r in _rules)
+            {
+                <tr>
+                    <td>@(r.IsEnabled ? "✓" : "—")</td>
+                    <td>@r.Name</td>
+                    <td>@(r.Server?.Name ?? "Global")</td>
+                    <td class="mono">@r.Metric @Op(r.Operator) @r.Threshold@ServerMonitor.Infrastructure.Alerting.AlertEngine.Unit(r.Metric)</td>
+                    <td><span class="status-badge @Fmt.SeverityClass(r.Severity)"><span class="dot"></span>@r.Severity</span></td>
+                    <td>@r.ConsecutiveBreaches</td>
+                    <td>@r.CooldownMinutes min</td>
+                    <td class="text-end">
+                        <button class="icon-btn" @onclick="() => Edit(r)"><i class="bi bi-pencil"></i></button>
+                        <button class="icon-btn" @onclick="() => DeleteAsync(r)"><i class="bi bi-trash"></i></button>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private List<AlertRule> _rules = [];
+    private List<Server> _servers = [];
+    private AlertRule? _edit;
+    private int _scope;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _servers = await Servers.ListAsync();
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync() => _rules = await Svc.RulesAsync();
+
+    private void New()
+    {
+        _edit = new AlertRule { Name = "New rule", Metric = AlertMetric.CpuPercent, Threshold = 80 };
+        _scope = 0;
+    }
+
+    private void Edit(AlertRule r)
+    {
+        _edit = new AlertRule
+        {
+            Id = r.Id, Name = r.Name, ServerId = r.ServerId, Metric = r.Metric, Operator = r.Operator, Threshold = r.Threshold, Severity = r.Severity,
+            ConsecutiveBreaches = r.ConsecutiveBreaches, CooldownMinutes = r.CooldownMinutes, IsEnabled = r.IsEnabled
+        };
+        _scope = r.ServerId ?? 0;
+    }
+
+    private async Task SaveAsync()
+    {
+        if (_edit is null) return;
+        _edit.ServerId = _scope == 0 ? null : _scope;
+        try
+        {
+            await Svc.SaveRuleAsync(_edit);
+            _edit = null;
+            await LoadAsync();
+            Toasts.Success("Rule saved");
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task DeleteAsync(AlertRule r)
+    {
+        try { await Svc.DeleteRuleAsync(r.Id); await LoadAsync(); }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private static string Op(ComparisonOperator o) => o switch
+    {
+        ComparisonOperator.GreaterThan => ">", ComparisonOperator.GreaterThanOrEqual => "≥", ComparisonOperator.LessThan => "<", _ => "≤"
+    };
+}

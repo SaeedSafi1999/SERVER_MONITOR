@@ -1,0 +1,117 @@
+@page "/alerts"
+@implements IDisposable
+@inject AlertManagementService Svc
+@inject ServerManagementService Servers
+@inject LiveUpdates Live
+@inject ToastService Toasts
+
+<PageTitle>Alerts · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Alerts</h1>
+        <div class="sub">Notification center — deduplicated alerts with acknowledgement and resolution</div>
+    </div>
+    <div class="actions">
+        <AuthorizeView Roles="@Roles.Admin"><a class="btn btn-sm btn-outline-light" href="alerts/rules"><i class="bi bi-sliders me-1"></i>Alert rules</a></AuthorizeView>
+    </div>
+</div>
+
+<div class="stat-grid">
+    <StatCard Label="Open" Value="@_items.Count(a => a.Status == AlertStatus.Open).ToString()" Icon="bi-bell" Kind="critical" />
+    <StatCard Label="Acknowledged" Value="@_items.Count(a => a.Status == AlertStatus.Acknowledged).ToString()" Icon="bi-check2" Kind="warning" />
+    <StatCard Label="Critical (unresolved)" Value="@_items.Count(a => a.Status != AlertStatus.Resolved && a.Severity == AlertSeverity.Critical).ToString()" Icon="bi-x-octagon" Kind="critical" />
+    <StatCard Label="Resolved (shown)" Value="@_items.Count(a => a.Status == AlertStatus.Resolved).ToString()" Icon="bi-check2-all" Kind="healthy" />
+</div>
+
+<div class="glass p-3 mb-3 d-flex flex-wrap gap-2 align-items-center">
+    <select class="form-select form-select-sm w-auto" @bind="_status" @bind:after="LoadAsync">
+        <option value="">All statuses</option>
+        <option value="unresolved">Unresolved</option>
+        @foreach (var s in Enum.GetValues<AlertStatus>()) { <option value="@s">@s</option> }
+    </select>
+    <select class="form-select form-select-sm w-auto" @bind="_severity" @bind:after="LoadAsync">
+        <option value="">All severities</option>
+        @foreach (var s in Enum.GetValues<AlertSeverity>()) { <option value="@s">@s</option> }
+    </select>
+    <select class="form-select form-select-sm w-auto" @bind="_serverId" @bind:after="LoadAsync">
+        <option value="0">All servers</option>
+        @foreach (var s in _servers) { <option value="@s.Id">@s.Name</option> }
+    </select>
+    <span class="ms-auto small text-secondary">@_items.Count alerts</span>
+</div>
+
+<div class="glass table-wrap">
+    <table class="table-dark-glass">
+        <thead><tr><th>Severity</th><th>Status</th><th>Alert</th><th>Server</th><th>Value</th><th>First seen</th><th>Last seen</th><th>Count</th><th>Handled by</th><th></th></tr></thead>
+        <tbody>
+            @foreach (var a in _items)
+            {
+                <tr @key="a.Id">
+                    <td><span class="status-badge @Fmt.SeverityClass(a.Severity)"><span class="dot"></span>@a.Severity</span></td>
+                    <td>@a.Status</td>
+                    <td><div>@a.Title</div><div class="small text-secondary">@a.Message</div></td>
+                    <td><a href="servers/@a.ServerId">@a.Server?.Name</a></td>
+                    <td class="mono">@Fmt.Num(a.Value)</td>
+                    <td class="small text-nowrap">@Fmt.Time(a.FirstSeenAt)</td>
+                    <td class="small text-nowrap">@Fmt.Ago(a.LastSeenAt)</td>
+                    <td>@a.OccurrenceCount</td>
+                    <td class="small">@(a.ResolvedBy ?? a.AcknowledgedBy)</td>
+                    <td class="text-end text-nowrap">
+                        <AuthorizeView Policy="Operator">
+                            @if (a.Status == AlertStatus.Open) { <button class="btn btn-sm btn-outline-warning" @onclick="() => AckAsync(a)">Acknowledge</button> }
+                            @if (a.Status != AlertStatus.Resolved) { <button class="btn btn-sm btn-outline-success ms-1" @onclick="() => ResolveAsync(a)">Resolve</button> }
+                        </AuthorizeView>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    @if (_items.Count == 0) { <div class="p-4 text-center text-secondary">No alerts match the filters. 🎉</div> }
+</div>
+
+@code {
+    private List<Alert> _items = [];
+    private List<Server> _servers = [];
+    private string _status = "unresolved";
+    private string _severity = "";
+    private int _serverId;
+    private bool _busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _servers = await Servers.ListAsync();
+        await LoadAsync();
+        Live.AlertChanged += OnAlert;
+    }
+
+    private async Task LoadAsync()
+    {
+        if (_busy) return;
+        _busy = true;
+        try
+        {
+            AlertStatus? status = Enum.TryParse<AlertStatus>(_status, out var st) ? st : null;
+            AlertSeverity? sev = Enum.TryParse<AlertSeverity>(_severity, out var sv) ? sv : null;
+            var items = await Svc.ListAsync(new AlertFilter(status, sev, _serverId == 0 ? null : _serverId, Take: 500));
+            _items = _status == "unresolved" ? items.Where(a => a.Status != AlertStatus.Resolved).ToList() : items;
+        }
+        finally { _busy = false; }
+    }
+
+    private void OnAlert(Alert a) => _ = InvokeAsync(async () => { await LoadAsync(); StateHasChanged(); });
+
+    private async Task AckAsync(Alert a)
+    {
+        try { await Svc.AcknowledgeAsync(a.Id); Toasts.Success("Acknowledged"); await LoadAsync(); }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task ResolveAsync(Alert a)
+    {
+        try { await Svc.ResolveAsync(a.Id); Toasts.Success("Resolved"); await LoadAsync(); }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    public void Dispose() => Live.AlertChanged -= OnAlert;
+}

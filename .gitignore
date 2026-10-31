@@ -1,0 +1,12 @@
+bin/
+obj/
+*.user
+.vs/
+.vscode/
+.idea/
+.env
+keys/
+.dev-keys/
+**/keys/
+TestResults/
+*.pfx

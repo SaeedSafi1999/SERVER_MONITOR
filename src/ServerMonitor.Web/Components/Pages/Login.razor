@@ -1,0 +1,88 @@
+@page "/login"
+@attribute [AllowAnonymous]
+@attribute [ExcludeFromInteractiveRouting]
+@attribute [Microsoft.AspNetCore.RateLimiting.EnableRateLimiting("login")]
+@layout EmptyLayout
+@using System.ComponentModel.DataAnnotations
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Identity
+@using ServerMonitor.Infrastructure.Persistence
+@inject SignInManager<ApplicationUser> SignIn
+@inject UserManager<ApplicationUser> Users
+@inject IAuditService Audit
+@inject NavigationManager Nav
+
+<PageTitle>Sign in · ServerMonitor</PageTitle>
+
+<div class="glass auth-card">
+    <div class="brand mb-4 justify-content-center">
+        <span class="brand-mark"><i class="bi bi-activity"></i></span>
+        <span class="brand-text">Server<b>Monitor</b></span>
+    </div>
+    <h1 class="h5 text-center mb-4">Sign in to continue</h1>
+
+    @if (_error is not null)
+    {
+        <div class="alert alert-danger py-2 small">@_error</div>
+    }
+
+    <EditForm Model="Input" method="post" OnValidSubmit="LoginAsync" FormName="login">
+        <DataAnnotationsValidator />
+        <div class="mb-3">
+            <label class="form-label small text-secondary" for="email">Email</label>
+            <InputText id="email" @bind-Value="Input.Email" class="form-control" autocomplete="username" />
+            <ValidationMessage For="() => Input.Email" />
+        </div>
+        <div class="mb-4">
+            <label class="form-label small text-secondary" for="password">Password</label>
+            <InputText id="password" type="password" @bind-Value="Input.Password" class="form-control" autocomplete="current-password" />
+            <ValidationMessage For="() => Input.Password" />
+        </div>
+        <button type="submit" class="btn btn-primary w-100">Sign in</button>
+    </EditForm>
+</div>
+
+@code {
+    [CascadingParameter] private HttpContext HttpContext { get; set; } = default!;
+    [SupplyParameterFromForm] private LoginModel Input { get; set; } = default!;
+    [SupplyParameterFromQuery] private string? ReturnUrl { get; set; }
+    private string? _error;
+
+    public sealed class LoginModel
+    {
+        [Required, EmailAddress] public string Email { get; set; } = "";
+        [Required] public string Password { get; set; } = "";
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Input ??= new();
+        if (HttpMethods.IsGet(HttpContext.Request.Method))
+            await HttpContext.SignOutAsync(IdentityConstants.ExternalScheme);
+    }
+
+    private async Task LoginAsync()
+    {
+        Input ??= new();
+        var user = await Users.FindByEmailAsync(Input.Email);
+        if (user is not null && !user.IsActive)
+        {
+            _error = "Invalid credentials.";
+            await Audit.WriteAsync("auth.login.denied", "User", user.Id, "inactive account");
+            return;
+        }
+        var result = await SignIn.PasswordSignInAsync(user?.UserName ?? Input.Email, Input.Password, isPersistent: false, lockoutOnFailure: true);
+        if (result.Succeeded)
+        {
+            user!.LastLoginAt = DateTimeOffset.UtcNow;
+            await Users.UpdateAsync(user);
+            await Audit.WriteAsync("auth.login", "User", user.Id, user.Email);
+            var target = string.IsNullOrEmpty(ReturnUrl) || !Uri.IsWellFormedUriString(ReturnUrl, UriKind.Relative) || ReturnUrl.StartsWith("//") ? "/" : "/" + ReturnUrl.TrimStart('/');
+            Nav.NavigateTo(target, forceLoad: true);
+            return;
+        }
+        // Same message for unknown user / wrong password (no user enumeration).
+        _error = result.IsLockedOut ? "Account locked after too many failed attempts. Try again later." : "Invalid credentials.";
+        await Audit.WriteAsync(result.IsLockedOut ? "auth.login.locked" : "auth.login.failed", "User", user?.Id, Input.Email);
+    }
+}

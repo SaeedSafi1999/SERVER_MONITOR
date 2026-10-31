@@ -1,0 +1,53 @@
+@page "/audit"
+@attribute [Authorize(Roles = Roles.Admin)]
+@inject AlertManagementService Svc
+@inject IJSRuntime JS
+
+<PageTitle>Audit log · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Audit log</h1>
+        <div class="sub">Every login, configuration change, connection test, service restart and log access</div>
+    </div>
+    <div class="actions">
+        <input class="form-control form-control-sm w-auto" placeholder="Search action, user, details…" @bind="_search" @bind:after="LoadAsync" />
+        <button class="btn btn-sm btn-outline-light" @onclick="ExportAsync"><i class="bi bi-download me-1"></i>CSV</button>
+    </div>
+</div>
+
+<div class="glass table-wrap" style="max-height:75vh">
+    <table class="table-dark-glass">
+        <thead><tr><th>Time</th><th>User</th><th>IP</th><th>Action</th><th>Entity</th><th>Details</th></tr></thead>
+        <tbody>
+            @foreach (var a in _items)
+            {
+                <tr>
+                    <td class="small text-nowrap">@Fmt.Time(a.Timestamp)</td>
+                    <td class="small">@a.UserName</td>
+                    <td class="mono small">@a.IpAddress</td>
+                    <td class="mono small">@a.Action</td>
+                    <td class="small">@a.EntityType @a.EntityId</td>
+                    <td class="small text-break">@a.Details</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private List<AuditLog> _items = [];
+    private string? _search;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync() => _items = await Svc.AuditAsync(_search, 1000);
+
+    private async Task ExportAsync()
+    {
+        var sb = new System.Text.StringBuilder("timestamp_utc,user,ip,action,entity_type,entity_id,details\n");
+        foreach (var a in _items)
+            sb.AppendLine(string.Join(',', a.Timestamp.UtcDateTime.ToString("O"), MetricsQueryService.Csv(a.UserName), a.IpAddress, a.Action, a.EntityType, a.EntityId, MetricsQueryService.Csv(a.Details)));
+        await JS.InvokeVoidAsync("smDownload", $"audit-{DateTime.UtcNow:yyyyMMddHHmm}.csv", "text/csv", sb.ToString());
+    }
+}

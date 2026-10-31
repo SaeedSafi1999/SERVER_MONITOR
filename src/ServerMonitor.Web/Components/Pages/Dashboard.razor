@@ -1,0 +1,171 @@
+@page "/"
+@implements IDisposable
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+@inject ServerManagementService Servers
+@inject AlertManagementService Alerts
+@inject NavigationManager Nav
+
+<PageTitle>Overview · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Overview</h1>
+        <div class="sub">Real-time health of all monitored servers</div>
+    </div>
+    <div class="actions">
+        <select class="form-select form-select-sm w-auto" @bind="_groupFilter" @bind:after="Recompute">
+            <option value="0">All groups</option>
+            @foreach (var g in _groups) { <option value="@g.Id">@g.Name</option> }
+        </select>
+        <input class="form-control form-control-sm w-auto" placeholder="Search name, IP, tag…" @bind="_search" @bind:event="oninput" @bind:after="Recompute" />
+    </div>
+</div>
+
+<div class="stat-grid">
+    <StatCard Label="Total servers" Value="@_states.Count.ToString()" Icon="bi-hdd-rack" Loading="_loading" />
+    <StatCard Label="Online" Value="@Count(HealthStatus.Healthy, HealthStatus.Warning, HealthStatus.Critical).ToString()" Icon="bi-check2-circle" Kind="healthy" Loading="_loading" />
+    <StatCard Label="Offline" Value="@Count(HealthStatus.Offline).ToString()" Icon="bi-power" Kind="offline" Loading="_loading" />
+    <StatCard Label="Warning" Value="@Count(HealthStatus.Warning).ToString()" Icon="bi-exclamation-triangle" Kind="warning" Loading="_loading" />
+    <StatCard Label="Critical" Value="@Count(HealthStatus.Critical).ToString()" Icon="bi-x-octagon" Kind="critical" Loading="_loading" />
+    <StatCard Label="Open alerts" Value="@_openAlerts.ToString()" Icon="bi-bell" Kind="@(_openAlerts > 0 ? "critical" : "")" Loading="_loading" />
+    <StatCard Label="Avg CPU" Value="@Fmt.Pct(Avg(s => s.Sample?.Snapshot.CpuPercent))" Icon="bi-cpu" Loading="_loading" />
+    <StatCard Label="Avg RAM" Value="@Fmt.Pct(Avg(s => s.Sample?.Snapshot.MemPercent))" Icon="bi-memory" Loading="_loading" />
+    <StatCard Label="Avg disk" Value="@Fmt.Pct(Avg(s => s.Sample?.Snapshot.DiskPercent))" Icon="bi-device-hdd" Loading="_loading" />
+    <StatCard Label="Avg latency (ICMP)" Value="@Fmt.Ms(Avg(s => s.Icmp?.AvgMs))" Icon="bi-broadcast" Loading="_loading" />
+    <StatCard Label="Avg response (HTTP)" Value="@Fmt.Ms(Avg(s => s.Http?.TotalMs))" Sub="@($"TCP connect {Fmt.Ms(Avg(s => s.Tcp?.CurrentMs))}")" Icon="bi-speedometer2" Loading="_loading" />
+</div>
+
+@if (_loading)
+{
+    <div class="server-grid">
+        @for (var i = 0; i < 6; i++) { <div class="skeleton" style="height:230px"></div> }
+    </div>
+}
+else if (_states.Count == 0)
+{
+    <div class="glass p-5 text-center">
+        <i class="bi bi-hdd-network fs-1 text-secondary"></i>
+        <h2 class="h5 mt-3">No servers yet</h2>
+        <p class="text-secondary">Add a Linux (SSH) or Windows (WinRM) server to start collecting real metrics.</p>
+        <AuthorizeView Roles="@Roles.Admin"><a class="btn btn-primary" href="servers/new"><i class="bi bi-plus-lg me-1"></i>Add server</a></AuthorizeView>
+    </div>
+}
+else
+{
+    <div class="server-grid">
+        @foreach (var s in _visible)
+        {
+            var snap = s.Sample?.Snapshot;
+            <div class="server-card glass @Fmt.StatusClass(s.Status)" @key="s.ServerId" @onclick='() => Nav.NavigateTo($"servers/{s.ServerId}")'>
+                <div class="server-card-head">
+                    <i class="bi @(s.OperatingSystem == OperatingSystemFamily.Windows ? "bi-windows" : "bi-ubuntu") fs-4 text-secondary"></i>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="server-name text-truncate">@s.Name</div>
+                        <div class="server-meta text-truncate">@s.Host · @(s.OsVersion ?? s.OperatingSystem.ToString())</div>
+                    </div>
+                    <StatusBadge Status="s.Status" />
+                </div>
+                @if (snap is not null && s.Status != HealthStatus.Offline)
+                {
+                    <MeterBar Label="CPU" Value="snap.CpuPercent" />
+                    <MeterBar Label="RAM" Value="snap.MemPercent" Text="@($"{Fmt.Pct(snap.MemPercent)} of {Fmt.Bytes(snap.MemTotal)}")" />
+                    <MeterBar Label="Disk" Value="snap.DiskPercent" Text="@($"{Fmt.Pct(snap.DiskPercent)} of {Fmt.Bytes(snap.DiskTotal)}")" />
+                    <div class="d-flex justify-content-between small">
+                        <span class="text-secondary"><i class="bi bi-arrow-down"></i> @Fmt.Rate(snap.NetRxBytesPerSec)</span>
+                        <span class="text-secondary"><i class="bi bi-arrow-up"></i> @Fmt.Rate(snap.NetTxBytesPerSec)</span>
+                        <span class="text-secondary"><i class="bi bi-broadcast"></i> @Fmt.Ms(s.Icmp?.AvgMs)</span>
+                    </div>
+                }
+                else
+                {
+                    <div class="text-secondary small py-3">
+                        @if (s.ConnectionState is ConnectionState.HostKeyNotTrusted)
+                        {
+                            <span><i class="bi bi-key me-1 text-warning"></i>Host identity not trusted yet — open the server and run "Test connection".</span>
+                        }
+                        else if (!string.IsNullOrEmpty(s.LastError))
+                        {
+                            <span class="text-break"><i class="bi bi-exclamation-circle me-1 text-danger"></i>@s.LastError</span>
+                        }
+                        else
+                        {
+                            <span>Waiting for first sample…</span>
+                        }
+                    </div>
+                }
+                <div class="server-foot">
+                    <span title="Uptime"><i class="bi bi-clock-history"></i> @Fmt.Uptime(snap?.UptimeSeconds ?? 0)</span>
+                    <span>@(s.OpenAlerts > 0 ? $"{s.OpenAlerts} alert(s)" : "")</span>
+                    <span title="Last data">@Fmt.Ago(s.LastSeenAt)</span>
+                </div>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private bool _loading = true;
+    private List<ServerLiveState> _states = [];
+    private List<ServerLiveState> _visible = [];
+    private List<ServerGroup> _groups = [];
+    private Dictionary<int, (int? GroupId, string Tags)> _meta = [];
+    private int _groupFilter;
+    private string _search = "";
+    private int _openAlerts;
+    private DateTime _lastRender;
+    private Timer? _agoTimer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var servers = await Servers.ListAsync();
+        foreach (var s in servers) Cache.GetOrAdd(s);
+        _meta = servers.ToDictionary(s => s.Id, s => (s.GroupId, s.Tags));
+        _groups = await Servers.GroupsAsync();
+        _openAlerts = await Alerts.OpenCountAsync();
+        Recompute();
+        _loading = false;
+        Live.ServerUpdated += OnUpdate;
+        Live.AlertChanged += OnAlert;
+        // Keep "x seconds ago" labels fresh.
+        _agoTimer = new Timer(_ => InvokeAsync(StateHasChanged), null, 5000, 5000);
+    }
+
+    private void Recompute()
+    {
+        _states = Cache.All().Where(s => _meta.ContainsKey(s.ServerId)).ToList();
+        _visible = _states
+            .Where(s => _groupFilter == 0 || _meta.GetValueOrDefault(s.ServerId).GroupId == _groupFilter)
+            .Where(s => string.IsNullOrWhiteSpace(_search)
+                        || s.Name.Contains(_search, StringComparison.OrdinalIgnoreCase)
+                        || s.Host.Contains(_search, StringComparison.OrdinalIgnoreCase)
+                        || (_meta.GetValueOrDefault(s.ServerId).Tags ?? "").Contains(_search, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(s => s.Status == HealthStatus.Critical).ThenByDescending(s => s.Status == HealthStatus.Offline)
+            .ThenByDescending(s => s.Status == HealthStatus.Warning).ThenBy(s => s.Name)
+            .ToList();
+    }
+
+    private int Count(params HealthStatus[] statuses) => _states.Count(s => statuses.Contains(s.Status));
+
+    private double? Avg(Func<ServerLiveState, double?> f)
+    {
+        var v = _states.Where(s => s.Status != HealthStatus.Offline).Select(f).Where(x => x.HasValue).Select(x => x!.Value).ToList();
+        return v.Count == 0 ? null : v.Average();
+    }
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if ((DateTime.UtcNow - _lastRender).TotalMilliseconds < 750) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(() => { Recompute(); StateHasChanged(); });
+    }
+
+    private void OnAlert(Alert a) => _ = InvokeAsync(async () => { _openAlerts = await Alerts.OpenCountAsync(); StateHasChanged(); });
+
+    public void Dispose()
+    {
+        Live.ServerUpdated -= OnUpdate;
+        Live.AlertChanged -= OnAlert;
+        _agoTimer?.Dispose();
+    }
+}

@@ -1,0 +1,327 @@
+@page "/servers/new"
+@page "/servers/{Id:int}/edit"
+@attribute [Authorize(Roles = Roles.Admin)]
+@inject ServerManagementService Svc
+@inject IServerAdapterFactory Adapters
+@inject ToastService Toasts
+@inject NavigationManager Nav
+
+<PageTitle>@(Id is null ? "Add server" : "Edit server") · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>@(Id is null ? "Add server" : $"Edit {_model.Name}")</h1>
+        <div class="sub">Credentials are encrypted at rest and never sent back to the browser.</div>
+    </div>
+    <div class="actions">
+        <a class="btn btn-sm btn-outline-light" href="@(Id is null ? "servers" : $"servers/{Id}")">Cancel</a>
+    </div>
+</div>
+
+@if (_loading)
+{
+    <div class="skeleton" style="height:400px"></div>
+}
+else
+{
+    <EditForm Model="_model" OnValidSubmit="SaveAsync" FormName="server-edit">
+        <DataAnnotationsValidator />
+        <div class="row g-3">
+            <div class="col-xl-6">
+                <div class="glass form-section">
+                    <h2><i class="bi bi-hdd me-2"></i>Identity</h2>
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label small">Server name</label>
+                            <InputText class="form-control" @bind-Value="_model.Name" />
+                            <ValidationMessage For="() => _model.Name" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small">IP address / hostname</label>
+                            <InputText class="form-control mono" @bind-Value="_model.Host" />
+                            <ValidationMessage For="() => _model.Host" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small">Operating system</label>
+                            <InputSelect class="form-select" Value="_model.OperatingSystem" ValueExpression="() => _model.OperatingSystem" ValueChanged="(OperatingSystemFamily v) => OnOsChanged(v)">
+                                <option value="@OperatingSystemFamily.Linux">Linux</option>
+                                <option value="@OperatingSystemFamily.Windows">Windows Server</option>
+                            </InputSelect>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small">Group</label>
+                            <InputSelect class="form-select" @bind-Value="_model.GroupId">
+                                <option value="">— none —</option>
+                                @foreach (var g in _groups) { <option value="@g.Id">@g.Name</option> }
+                            </InputSelect>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small">Tags (comma separated)</label>
+                            <InputText class="form-control" @bind-Value="_model.Tags" placeholder="prod, web, eu" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small">Location</label>
+                            <InputText class="form-control" @bind-Value="_model.Location" placeholder="Tehran DC1 / rack 4" />
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label small">Description</label>
+                            <InputTextArea class="form-control" rows="2" @bind-Value="_model.Description" />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass form-section">
+                    <h2><i class="bi bi-activity me-2"></i>Monitoring</h2>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label small">Interval (seconds)</label>
+                            <InputNumber class="form-control" @bind-Value="_model.MonitoringIntervalSeconds" min="10" max="3600" />
+                            <ValidationMessage For="() => _model.MonitoringIntervalSeconds" />
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label small">TCP probe port</label>
+                            <InputNumber class="form-control" @bind-Value="_model.TcpProbePort" placeholder="@_model.ManagementPort" />
+                        </div>
+                        <div class="col-md-4 d-flex align-items-end gap-3">
+                            <div class="form-check form-switch">
+                                <InputCheckbox class="form-check-input" id="mon" @bind-Value="_model.IsMonitoringEnabled" />
+                                <label class="form-check-label small" for="mon">Enabled</label>
+                            </div>
+                            <div class="form-check form-switch">
+                                <InputCheckbox class="form-check-input" id="icmp" @bind-Value="_model.IcmpEnabled" />
+                                <label class="form-check-label small" for="icmp">ICMP</label>
+                            </div>
+                        </div>
+                        <div class="col-md-8">
+                            <label class="form-label small">HTTP(S) health-check URL (optional)</label>
+                            <InputText class="form-control mono" @bind-Value="_model.HealthCheckUrl" placeholder="https://app.example.com/health" />
+                            <ValidationMessage For="() => _model.HealthCheckUrl" />
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label small">Expected status</label>
+                            <InputNumber class="form-control" @bind-Value="_model.HealthCheckExpectedStatus" placeholder="2xx/3xx" />
+                        </div>
+                        <div class="col-12">
+                            <div class="form-check form-switch">
+                                <InputCheckbox class="form-check-input" id="svcctl" @bind-Value="_model.AllowServiceControl" />
+                                <label class="form-check-label small" for="svcctl">Allow Operators to restart monitored services on this host</label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-xl-6">
+                <div class="glass form-section">
+                    <h2><i class="bi bi-key me-2"></i>Connection</h2>
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label small">Protocol</label>
+                            <InputSelect class="form-select" Value="_model.Protocol" ValueExpression="() => _model.Protocol" ValueChanged="(ConnectionProtocol p) => OnProtocolChanged(p)">
+                                @if (_model.OperatingSystem == OperatingSystemFamily.Linux)
+                                {
+                                    <option value="@ConnectionProtocol.Ssh">SSH</option>
+                                }
+                                else
+                                {
+                                    <option value="@ConnectionProtocol.WinRmHttps">WinRM over HTTPS (5986)</option>
+                                    <option value="@ConnectionProtocol.WinRmHttp">WinRM over HTTP (5985) — not recommended</option>
+                                }
+                            </InputSelect>
+                            <ValidationMessage For="() => _model.Protocol" />
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small">@(_model.OperatingSystem == OperatingSystemFamily.Linux ? "SSH port" : "WinRM port")</label>
+                            <InputNumber class="form-control" @bind-Value="_model.ManagementPort" />
+                        </div>
+                        @if (_model.OperatingSystem == OperatingSystemFamily.Windows)
+                        {
+                            <div class="col-md-3">
+                                <label class="form-label small">RDP port</label>
+                                <InputNumber class="form-control" @bind-Value="_model.RdpPort" placeholder="3389" />
+                            </div>
+                        }
+                        <div class="col-md-6">
+                            <label class="form-label small">Username @(_model.OperatingSystem == OperatingSystemFamily.Windows ? "(DOMAIN\\user or user)" : "")</label>
+                            <InputText class="form-control mono" @bind-Value="_model.Username" autocomplete="off" />
+                            <ValidationMessage For="() => _model.Username" />
+                        </div>
+                        @if (_model.OperatingSystem == OperatingSystemFamily.Linux)
+                        {
+                            <div class="col-md-6">
+                                <label class="form-label small">Authentication</label>
+                                <InputSelect class="form-select" @bind-Value="_model.AuthMethod">
+                                    <option value="@AuthenticationMethod.PrivateKey">SSH private key (recommended)</option>
+                                    <option value="@AuthenticationMethod.Password">Password</option>
+                                </InputSelect>
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="col-md-6">
+                                <label class="form-label small">WinRM authentication</label>
+                                <InputSelect class="form-select" @bind-Value="_model.WinRmAuth">
+                                    <option value="@WinRmAuthScheme.Negotiate">Negotiate / NTLM</option>
+                                    <option value="@WinRmAuthScheme.Basic">Basic (HTTPS only)</option>
+                                </InputSelect>
+                            </div>
+                        }
+
+                        @if (_model.OperatingSystem == OperatingSystemFamily.Linux && _model.AuthMethod == AuthenticationMethod.PrivateKey)
+                        {
+                            <div class="col-12">
+                                <label class="form-label small">Private key (OpenSSH / PEM)</label>
+                                <InputTextArea class="form-control mono" rows="5" @bind-Value="_model.NewPrivateKey" autocomplete="off"
+                                               placeholder="@(_model.HasStoredPrivateKey ? "•••• stored — paste a new key to replace it" : "-----BEGIN OPENSSH PRIVATE KEY-----")" />
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small">Key passphrase (optional)</label>
+                                <InputText type="password" class="form-control" @bind-Value="_model.NewPrivateKeyPassphrase" autocomplete="new-password" />
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="col-md-6">
+                                <label class="form-label small">Password</label>
+                                <InputText type="password" class="form-control" @bind-Value="_model.NewPassword" autocomplete="new-password"
+                                           placeholder="@(_model.HasStoredPassword ? "•••••••• (unchanged)" : "")" />
+                                <div class="secret-hint">@(_model.HasStoredPassword ? "Leave empty to keep the stored password." : "Stored encrypted (AES-256 via Data Protection).")</div>
+                            </div>
+                        }
+                    </div>
+                </div>
+
+                @if (Id is not null)
+                {
+                    <div class="glass form-section">
+                        <h2><i class="bi bi-fingerprint me-2"></i>Host identity &amp; connection test</h2>
+                        <dl class="kv mb-3">
+                            <dt>Pinned @(_model.Protocol == ConnectionProtocol.Ssh ? "host key" : "certificate")</dt>
+                            <dd class="mono text-break">@(Pinned ?? "not pinned")</dd>
+                        </dl>
+                        <div class="d-flex gap-2 flex-wrap">
+                            <button type="button" class="btn btn-sm btn-outline-info" @onclick="TestAsync" disabled="@_testing">
+                                @if (_testing) { <span class="spinner-border spinner-border-sm me-1"></span> } else { <i class="bi bi-plug me-1"></i> }
+                                Test connection
+                            </button>
+                            @if (Pinned is not null)
+                            {
+                                <button type="button" class="btn btn-sm btn-outline-warning" @onclick="ClearTrustAsync"><i class="bi bi-x-circle me-1"></i>Forget pinned identity</button>
+                            }
+                        </div>
+                        @if (_test is not null)
+                        {
+                            <div class="mt-3 p-3 rounded" style="background:rgba(9,9,11,.6)">
+                                <div class="@(_test.Success ? "text-success" : "text-danger") fw-semibold mb-1">
+                                    <i class="bi @(_test.Success ? "bi-check-circle" : "bi-x-circle") me-1"></i>@_test.State — @_test.Message
+                                </div>
+                                <dl class="kv small mb-2">
+                                    @if (_test.Hostname is not null) { <dt>Hostname</dt><dd>@_test.Hostname</dd> }
+                                    @if (_test.OsVersion is not null) { <dt>OS</dt><dd>@_test.OsVersion</dd> }
+                                    @if (_test.ElapsedMs is not null) { <dt>Elapsed</dt><dd>@Fmt.Ms(_test.ElapsedMs)</dd> }
+                                    @if (_test.PresentedFingerprint is not null) { <dt>Presented</dt><dd class="mono text-break">@_test.PresentedFingerprint</dd> }
+                                </dl>
+                                @if (_test.PresentedFingerprint is not null && _test.PresentedFingerprint != Pinned)
+                                {
+                                    <div class="small text-warning mb-2">
+                                        Verify this fingerprint out-of-band (e.g. <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the server) before trusting it.
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-warning" @onclick="TrustAsync"><i class="bi bi-shield-check me-1"></i>Trust this @(_model.Protocol == ConnectionProtocol.Ssh ? "host key" : "certificate")</button>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="d-flex justify-content-end gap-2 mt-2">
+            <button type="submit" class="btn btn-primary" disabled="@_saving"><i class="bi bi-save me-1"></i>@(Id is null ? "Create server" : "Save changes")</button>
+        </div>
+    </EditForm>
+}
+
+@code {
+    [Parameter] public int? Id { get; set; }
+
+    private ServerEditModel _model = new();
+    private List<ServerGroup> _groups = [];
+    private bool _loading = true, _saving, _testing;
+    private ConnectionTestResult? _test;
+
+    private string? Pinned => _model.Protocol == ConnectionProtocol.Ssh ? _model.TrustedHostKeyFingerprint : _model.TrustedCertificateThumbprint;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _groups = await Svc.GroupsAsync();
+        if (Id is not null)
+        {
+            var server = await Svc.GetAsync(Id.Value);
+            if (server is null) { Nav.NavigateTo("servers"); return; }
+            _model = ServerManagementService.ToEditModel(server);
+        }
+        else
+        {
+            _model.AuthMethod = AuthenticationMethod.PrivateKey;
+        }
+        _loading = false;
+    }
+
+    private void OnOsChanged(OperatingSystemFamily os)
+    {
+        _model.OperatingSystem = os;
+        _model.Protocol = os == OperatingSystemFamily.Linux ? ConnectionProtocol.Ssh : ConnectionProtocol.WinRmHttps;
+        _model.ManagementPort = os == OperatingSystemFamily.Linux ? 22 : 5986;
+        if (os == OperatingSystemFamily.Windows) { _model.AuthMethod = AuthenticationMethod.Password; _model.RdpPort ??= 3389; }
+    }
+
+    private void OnProtocolChanged(ConnectionProtocol p)
+    {
+        _model.Protocol = p;
+        _model.ManagementPort = p switch { ConnectionProtocol.WinRmHttps => 5986, ConnectionProtocol.WinRmHttp => 5985, _ => 22 };
+    }
+
+    private async Task SaveAsync()
+    {
+        _saving = true;
+        try
+        {
+            var server = await Svc.SaveAsync(_model);
+            Toasts.Success(Id is null ? $"{server.Name} added. Run 'Test connection' to pin its host identity." : "Changes saved.");
+            Nav.NavigateTo(Id is null ? $"servers/{server.Id}/edit" : $"servers/{server.Id}");
+        }
+        catch (System.ComponentModel.DataAnnotations.ValidationException ex) { Toasts.Error(ex.Message); }
+        catch (Exception ex) { Toasts.Error("Save failed: " + ex.Message); }
+        finally { _saving = false; }
+    }
+
+    private async Task TestAsync()
+    {
+        _testing = true;
+        _test = null;
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            _test = await Svc.TestConnectionAsync(Id!.Value, cts.Token);
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+        finally { _testing = false; }
+    }
+
+    private async Task TrustAsync()
+    {
+        if (_test?.PresentedFingerprint is null) return;
+        await Svc.TrustIdentityAsync(Id!.Value, _test.PresentedFingerprint);
+        if (_model.Protocol == ConnectionProtocol.Ssh) _model.TrustedHostKeyFingerprint = _test.PresentedFingerprint;
+        else _model.TrustedCertificateThumbprint = _test.PresentedFingerprint;
+        Toasts.Success("Identity pinned. Collection will start within a few seconds.");
+    }
+
+    private async Task ClearTrustAsync()
+    {
+        await Svc.ClearTrustAsync(Id!.Value);
+        _model.TrustedHostKeyFingerprint = null;
+        _model.TrustedCertificateThumbprint = null;
+        Toasts.Warning("Pinned identity removed. Collection is paused until it is trusted again.");
+    }
+}

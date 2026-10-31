@@ -1,0 +1,17 @@
+<div class="meter">
+    <div class="meter-head">
+        <span class="meter-label">@Label</span>
+        <span class="meter-value">@(Text ?? Fmt.Pct(Value))</span>
+    </div>
+    <div class="meter-track">
+        <div class="meter-fill @Fmt.LevelClass(Value, Warn, Crit)" style="width:@(Math.Clamp(Value ?? 0, 0, 100).ToString(System.Globalization.CultureInfo.InvariantCulture))%"></div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public double? Value { get; set; }
+    [Parameter] public string? Text { get; set; }
+    [Parameter] public double Warn { get; set; } = 75;
+    [Parameter] public double Crit { get; set; } = 90;
+}

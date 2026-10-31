@@ -1,0 +1,113 @@
+name: servermonitor
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: servermonitor
+      POSTGRES_USER: servermonitor
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U servermonitor -d servermonitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    shm_size: 256m
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    # No published port: the database is reachable only from the app on the internal network.
+    networks: [backend]
+
+  app:
+    build: .
+    image: ${APP_IMAGE:-servermonitor:latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      TZ: ${TZ:-UTC}
+      ConnectionStrings__Monitor: Host=db;Port=5432;Database=servermonitor;Username=servermonitor;Password=${DB_PASSWORD}
+      Seed__AdminEmail: ${ADMIN_EMAIL:-admin@local}
+      Seed__AdminPassword: ${ADMIN_PASSWORD:-}
+      # Optional: wrap the key ring with a certificate (mount it read-only and set the path/password).
+      DataProtection__CertificatePath: ${DP_CERT_PATH:-}
+      DataProtection__CertificatePassword: ${DP_CERT_PASSWORD:-}
+      # X-Forwarded-* is trusted only from these addresses: the bundled Caddy, plus an optional external proxy.
+      ReverseProxy__KnownProxies__0: ${CADDY_IP:-172.30.0.10}
+      ReverseProxy__KnownProxies__1: ${PROXY_IP:-}
+    volumes:
+      # The key ring decrypts every stored server credential: back it up and keep it off the DB host.
+      - keys:/app/keys
+    # Hardening: read-only root filesystem, no Linux capabilities, no privilege escalation.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Lets the non-root process send ICMP echo through unprivileged datagram sockets (no NET_RAW needed).
+    sysctls:
+      net.ipv4.ping_group_range: "0 2147483647"
+    # HTTP_BIND=127.0.0.1 when the https profile (or another reverse proxy on this host) fronts the app.
+    ports:
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8080}:8080"
+    logging: *logging
+    networks: [backend]
+
+  # Optional reverse proxy with automatic HTTPS. Enable with: docker compose --profile https up -d
+  proxy:
+    image: caddy:2.8-alpine
+    profiles: [https]
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+      - caddy-config:/config
+    logging: *logging
+    networks:
+      backend:
+        ipv4_address: ${CADDY_IP:-172.30.0.10}
+
+  # Optional Linux target for trying the product with real data: docker compose --profile demo up -d
+  demo-target:
+    image: lscr.io/linuxserver/openssh-server:latest
+    profiles: [demo]
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      USER_NAME: monitor
+      USER_PASSWORD: ${DEMO_SSH_PASSWORD:-}
+      PASSWORD_ACCESS: "true"
+    logging: *logging
+    networks: [backend]
+
+volumes:
+  pgdata:
+  keys:
+  caddy:
+  caddy-config:
+
+networks:
+  backend:
+    ipam:
+      config:
+        # Fixed subnet so the proxy has a stable IP the app can trust. Change it if it overlaps your LAN.
+        - subnet: ${DOCKER_SUBNET:-172.30.0.0/24}

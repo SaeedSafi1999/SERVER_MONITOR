@@ -1,0 +1,217 @@
+@page "/logs"
+@attribute [Authorize(Policy = "Operator")]
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject IServerAdapterFactory Adapters
+@inject IAuditService Audit
+@inject ToastService Toasts
+@inject IJSRuntime JS
+
+<PageTitle>Logs · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Logs</h1>
+        <div class="sub">Read from allow-listed sources only. Live mode tails new entries every 5 seconds.</div>
+    </div>
+</div>
+
+<div class="glass p-3 mb-3 d-flex flex-wrap gap-2 align-items-center">
+    <select class="form-select form-select-sm w-auto" @bind="_serverId" @bind:after="OnServerChangedAsync">
+        <option value="0">Select server…</option>
+        @foreach (var s in _servers) { <option value="@s.Id">@s.Name</option> }
+    </select>
+    @if (_server is not null)
+    {
+        <select class="form-select form-select-sm w-auto" @bind="_source" @bind:after="ReloadAsync">
+            @foreach (var src in Adapters.For(_server).LogSources) { <option value="@src.Key">@src.DisplayName</option> }
+        </select>
+        <select class="form-select form-select-sm w-auto" @bind="_minLevel">
+            <option value="@LogLevelKind.Unknown">All levels</option>
+            <option value="@LogLevelKind.Notice">Notice+</option>
+            <option value="@LogLevelKind.Warning">Warning+</option>
+            <option value="@LogLevelKind.Error">Error+</option>
+        </select>
+        <select class="form-select form-select-sm w-auto" @bind="_hours" @bind:after="ReloadAsync">
+            <option value="1">Last hour</option>
+            <option value="6">Last 6 hours</option>
+            <option value="24">Last 24 hours</option>
+            <option value="168">Last 7 days</option>
+        </select>
+        <input class="form-control form-control-sm w-auto" placeholder="Search…" @bind="_search" @bind:event="oninput" />
+        <div class="form-check form-switch ms-2">
+            <input class="form-check-input" type="checkbox" id="live" checked="@_live" @onchange="e => ToggleLive((bool)e.Value!)" />
+            <label class="form-check-label small" for="live">Live</label>
+        </div>
+        <div class="ms-auto d-flex gap-2">
+            <button class="btn btn-sm btn-outline-light" @onclick="ReloadAsync" disabled="@_loading"><i class="bi bi-arrow-clockwise"></i></button>
+            <button class="btn btn-sm btn-outline-light" @onclick="ExportAsync"><i class="bi bi-download me-1"></i>Export</button>
+        </div>
+    }
+</div>
+
+<div class="glass log-view" id="logview">
+    @if (_loading && _entries.Count == 0)
+    {
+        <div class="p-3"><div class="skeleton" style="height:200px"></div></div>
+    }
+    else if (_server is null)
+    {
+        <div class="p-4 text-secondary">Choose a server to view its logs.</div>
+    }
+    else if (_error is not null)
+    {
+        <div class="p-4 text-danger">@_error</div>
+    }
+    else
+    {
+        <Virtualize Items="Filtered" Context="e" ItemSize="22">
+            <div class="log-line @e.Level" @onclick="() => _selected = e">
+                <span class="text-secondary">@e.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss")</span>
+                <span class="lvl">@e.Level</span>
+                <span class="text-secondary text-truncate">@e.Source</span>
+                <span class="msg">@Highlight(e.Message)</span>
+            </div>
+        </Virtualize>
+        @if (Filtered.Count == 0) { <div class="p-4 text-secondary">No log entries match.</div> }
+    }
+</div>
+<div class="small text-secondary mt-2">@Filtered.Count of @_entries.Count entries shown · @(_live ? "live" : "paused")</div>
+
+@if (_selected is not null)
+{
+    <div class="modal d-block" style="background:rgba(0,0,0,.5)" @onclick="() => _selected = null">
+        <div class="modal-dialog modal-lg modal-dialog-centered" @onclick:stopPropagation="true">
+            <div class="modal-content glass">
+                <div class="modal-body">
+                    <h5 class="mb-3">Log entry</h5>
+                    <dl class="kv">
+                        <dt>Time</dt><dd>@Fmt.Time(_selected.Timestamp) (UTC @_selected.Timestamp.UtcDateTime.ToString("O"))</dd>
+                        <dt>Level</dt><dd>@_selected.Level</dd>
+                        <dt>Source</dt><dd>@_selected.Source</dd>
+                    </dl>
+                    <pre class="mono mt-3 p-3 rounded" style="background:rgba(0,0,0,.35);white-space:pre-wrap">@_selected.Message</pre>
+                    <div class="text-end"><button class="btn btn-sm btn-outline-light" @onclick="() => _selected = null">Close</button></div>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [SupplyParameterFromQuery(Name = "server")] public int? ServerQuery { get; set; }
+
+    private List<Server> _servers = [];
+    private Server? _server;
+    private int _serverId;
+    private string _source = "";
+    private LogLevelKind _minLevel = LogLevelKind.Unknown;
+    private int _hours = 1;
+    private string _search = "";
+    private bool _live, _loading;
+    private string? _error;
+    private List<LogEntry> _entries = [];
+    private LogEntry? _selected;
+    private Timer? _timer;
+    private readonly CancellationTokenSource _cts = new();
+    private const int MaxBuffered = 5000;
+
+    private List<LogEntry> Filtered => _entries
+        .Where(e => _minLevel == LogLevelKind.Unknown || e.Level >= _minLevel)
+        .Where(e => string.IsNullOrWhiteSpace(_search) || e.Message.Contains(_search, StringComparison.OrdinalIgnoreCase) || e.Source.Contains(_search, StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        _servers = await Svc.ListAsync();
+        if (ServerQuery is { } id && _servers.Any(s => s.Id == id))
+        {
+            _serverId = id;
+            await OnServerChangedAsync();
+        }
+    }
+
+    private async Task OnServerChangedAsync()
+    {
+        _server = _servers.FirstOrDefault(s => s.Id == _serverId);
+        _entries = [];
+        if (_server is null) return;
+        _source = Adapters.For(_server).LogSources[0].Key;
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        if (_server is null) return;
+        _entries = [];
+        await FetchAsync(DateTimeOffset.UtcNow.AddHours(-_hours), 1000);
+        await Audit.WriteAsync("logs.view", "Server", _server.Id.ToString(), _source);
+    }
+
+    private async Task FetchAsync(DateTimeOffset since, int max)
+    {
+        if (_server is null || _loading) return;
+        _loading = true;
+        _error = null;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            cts.CancelAfter(TimeSpan.FromSeconds(60));
+            var newEntries = await Adapters.For(_server).ReadLogsAsync(_server, _source, since, max, cts.Token);
+            // De-duplicate on (time, message) when tailing.
+            var known = _entries.Count == 0 ? null : _entries.TakeLast(500).Select(e => (e.Timestamp, e.Message)).ToHashSet();
+            _entries.AddRange(known is null ? newEntries : newEntries.Where(e => !known.Contains((e.Timestamp, e.Message))));
+            _entries = _entries.OrderBy(e => e.Timestamp).TakeLast(MaxBuffered).ToList();
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested) { }
+        catch (Exception ex) { _error = "Could not read logs: " + ex.Message; }
+        finally { _loading = false; }
+        if (_live) { try { await JS.InvokeVoidAsync("smScrollBottom", "logview"); } catch { } }
+    }
+
+    private void ToggleLive(bool on)
+    {
+        _live = on;
+        _timer?.Dispose();
+        if (on)
+            _timer = new Timer(_ => InvokeAsync(async () =>
+            {
+                var since = _entries.Count > 0 ? _entries[^1].Timestamp.AddSeconds(-1) : DateTimeOffset.UtcNow.AddMinutes(-5);
+                await FetchAsync(since, 500);
+                StateHasChanged();
+            }), null, 5000, 5000);
+    }
+
+    private RenderFragment Highlight(string message) => builder =>
+    {
+        if (string.IsNullOrWhiteSpace(_search)) { builder.AddContent(0, message); return; }
+        var idx = 0;
+        var seq = 0;
+        while (true)
+        {
+            var hit = message.IndexOf(_search, idx, StringComparison.OrdinalIgnoreCase);
+            if (hit < 0) { builder.AddContent(seq++, message[idx..]); break; }
+            builder.AddContent(seq++, message[idx..hit]);
+            builder.OpenElement(seq++, "mark");
+            builder.AddContent(seq++, message.Substring(hit, _search.Length));
+            builder.CloseElement();
+            idx = hit + _search.Length;
+        }
+    };
+
+    private async Task ExportAsync()
+    {
+        var sb = new System.Text.StringBuilder("timestamp_utc,level,source,message\n");
+        foreach (var e in Filtered)
+            sb.AppendLine($"{e.Timestamp.UtcDateTime:O},{e.Level},{MetricsQueryService.Csv(e.Source)},{MetricsQueryService.Csv(e.Message)}");
+        await JS.InvokeVoidAsync("smDownload", $"{_server?.Name}-{_source}-{DateTime.UtcNow:yyyyMMddHHmm}.csv", "text/csv", sb.ToString());
+        await Audit.WriteAsync("logs.export", "Server", _server?.Id.ToString(), $"{_source}: {Filtered.Count} entries");
+    }
+
+    public void Dispose()
+    {
+        _timer?.Dispose();
+        _cts.Cancel();
+        _cts.Dispose();
+    }
+}

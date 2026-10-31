@@ -1,0 +1,34 @@
+@page "/services"
+@page "/ports"
+@page "/security"
+@inject NavigationManager Nav
+
+@{
+    var path = Nav.ToBaseRelativePath(Nav.Uri).Split('?')[0];
+}
+
+@switch (path)
+{
+    case "services":
+        <PageTitle>Services · ServerMonitor</PageTitle>
+        <div class="page-header">
+            <div><h1>Service monitoring</h1><div class="sub">systemd units and Windows services across all servers. Add services from a server's Services tab.</div></div>
+        </div>
+        <ServiceTable />
+        break;
+    case "ports":
+        <PageTitle>Ports · ServerMonitor</PageTitle>
+        <div class="page-header">
+            <div><h1>Port monitoring</h1><div class="sub">Only administrator-defined ports are checked (TCP connect). No range scanning.</div></div>
+        </div>
+        <PortTable />
+        break;
+    default:
+        <PageTitle>Security · ServerMonitor</PageTitle>
+        <div class="page-header">
+            <div><h1>Security monitoring</h1><div class="sub">Login activity, firewall, listening ports, service changes, updates and certificates</div></div>
+        </div>
+        <SecurityOverview />
+        <SecurityPanel />
+        break;
+}

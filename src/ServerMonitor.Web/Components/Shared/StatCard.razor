@@ -1,0 +1,24 @@
+<div class="stat-card glass @Kind">
+    <div class="stat-icon"><i class="bi @Icon"></i></div>
+    <div>
+        <div class="stat-label">@Label</div>
+        @if (Loading)
+        {
+            <div class="skeleton" style="height:28px;width:80px"></div>
+        }
+        else
+        {
+            <div class="stat-value animate-in" @key="Value">@Value</div>
+        }
+        @if (Sub is not null) { <div class="stat-sub">@Sub</div> }
+    </div>
+</div>
+
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public string Value { get; set; } = "";
+    [Parameter] public string? Sub { get; set; }
+    [Parameter] public string Icon { get; set; } = "bi-circle";
+    [Parameter] public string Kind { get; set; } = "";
+    [Parameter] public bool Loading { get; set; }
+}

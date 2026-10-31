@@ -1,0 +1,177 @@
+@page "/users"
+@attribute [Authorize(Roles = Roles.Admin)]
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.EntityFrameworkCore
+@using ServerMonitor.Infrastructure.Persistence
+@inject UserManager<ApplicationUser> UserManager
+@inject IAuditService Audit
+@inject ICurrentUser Me
+@inject ToastService Toasts
+
+<PageTitle>Users · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>User management</h1>
+        <div class="sub">Admin: full control · Operator: acknowledge alerts, restart services, view logs · Viewer: read-only</div>
+    </div>
+    <div class="actions"><button class="btn btn-sm btn-primary" @onclick="New"><i class="bi bi-person-plus me-1"></i>New user</button></div>
+</div>
+
+@if (_form is not null)
+{
+    <div class="glass form-section">
+        <h2>@(_form.Id is null ? "New user" : $"Edit {_form.Email}")</h2>
+        <div class="row g-3">
+            <div class="col-md-4"><label class="form-label small">Email</label><input class="form-control" @bind="_form.Email" disabled="@(_form.Id is not null)" /></div>
+            <div class="col-md-3"><label class="form-label small">Display name</label><input class="form-control" @bind="_form.DisplayName" maxlength="128" /></div>
+            <div class="col-md-2">
+                <label class="form-label small">Role</label>
+                <select class="form-select" @bind="_form.Role">@foreach (var r in Roles.All) { <option value="@r">@r</option> }</select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small">@(_form.Id is null ? "Password" : "New password (optional)")</label>
+                <input type="password" class="form-control" @bind="_form.Password" autocomplete="new-password" />
+                <div class="secret-hint">Min. 12 characters with upper, lower, digit and symbol.</div>
+            </div>
+            <div class="col-md-3">
+                <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="act" @bind="_form.IsActive" /><label class="form-check-label small" for="act">Active</label></div>
+            </div>
+        </div>
+        <div class="d-flex justify-content-end gap-2 mt-3">
+            <button class="btn btn-sm btn-outline-light" @onclick="() => _form = null">Cancel</button>
+            <button class="btn btn-sm btn-primary" @onclick="SaveAsync">Save</button>
+        </div>
+    </div>
+}
+
+<div class="glass table-wrap">
+    <table class="table-dark-glass">
+        <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last login</th><th>Created</th><th>Lockout</th><th></th></tr></thead>
+        <tbody>
+            @foreach (var (u, role) in _users)
+            {
+                <tr>
+                    <td><div>@u.DisplayName</div><div class="small text-secondary">@u.Email</div></td>
+                    <td>@role</td>
+                    <td>@(u.IsActive ? "Active" : "Disabled")</td>
+                    <td class="small">@Fmt.Time(u.LastLoginAt)</td>
+                    <td class="small">@Fmt.Time(u.CreatedAt)</td>
+                    <td class="small">@(u.LockoutEnd > DateTimeOffset.UtcNow ? $"locked until {Fmt.Time(u.LockoutEnd)}" : "—")</td>
+                    <td class="text-end text-nowrap">
+                        <button class="icon-btn" title="Edit" @onclick="() => Edit(u, role)"><i class="bi bi-pencil"></i></button>
+                        <button class="icon-btn" title="Sign out all sessions" @onclick="() => RevokeSessionsAsync(u)"><i class="bi bi-door-closed"></i></button>
+                        @if (u.LockoutEnd > DateTimeOffset.UtcNow) { <button class="icon-btn" title="Unlock" @onclick="() => UnlockAsync(u)"><i class="bi bi-unlock"></i></button> }
+                        @if (u.UserName != Me.UserName) { <button class="icon-btn" title="Delete" @onclick="() => DeleteAsync(u)"><i class="bi bi-trash"></i></button> }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private sealed class UserForm
+    {
+        public string? Id { get; set; }
+        public string Email { get; set; } = "";
+        public string? DisplayName { get; set; }
+        public string Role { get; set; } = Roles.Viewer;
+        public string? Password { get; set; }
+        public bool IsActive { get; set; } = true;
+    }
+
+    private List<(ApplicationUser User, string Role)> _users = [];
+    private UserForm? _form;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        var list = await UserManager.Users.OrderBy(u => u.Email).ToListAsync();
+        var result = new List<(ApplicationUser, string)>();
+        foreach (var u in list) result.Add((u, (await UserManager.GetRolesAsync(u)).FirstOrDefault() ?? "—"));
+        _users = result;
+    }
+
+    private void New() => _form = new UserForm();
+
+    private void Edit(ApplicationUser u, string role) =>
+        _form = new UserForm { Id = u.Id, Email = u.Email ?? "", DisplayName = u.DisplayName, Role = Roles.All.Contains(role) ? role : Roles.Viewer, IsActive = u.IsActive };
+
+    private async Task SaveAsync()
+    {
+        if (_form is null) return;
+        if (!Roles.All.Contains(_form.Role)) { Toasts.Error("Invalid role."); return; }
+        IdentityResult result;
+        ApplicationUser user;
+        if (_form.Id is null)
+        {
+            if (string.IsNullOrEmpty(_form.Password)) { Toasts.Error("Password is required."); return; }
+            user = new ApplicationUser { UserName = _form.Email.Trim(), Email = _form.Email.Trim(), DisplayName = _form.DisplayName, IsActive = _form.IsActive, EmailConfirmed = true };
+            result = await UserManager.CreateAsync(user, _form.Password);
+            if (result.Succeeded) result = await UserManager.AddToRoleAsync(user, _form.Role);
+        }
+        else
+        {
+            user = (await UserManager.FindByIdAsync(_form.Id))!;
+            if (user.UserName == Me.UserName && (_form.Role != Roles.Admin || !_form.IsActive))
+            {
+                Toasts.Error("You cannot demote or disable your own account.");
+                return;
+            }
+            user.DisplayName = _form.DisplayName;
+            user.IsActive = _form.IsActive;
+            result = await UserManager.UpdateAsync(user);
+            if (result.Succeeded)
+            {
+                var current = await UserManager.GetRolesAsync(user);
+                if (!current.SequenceEqual([_form.Role]))
+                {
+                    await UserManager.RemoveFromRolesAsync(user, current);
+                    result = await UserManager.AddToRoleAsync(user, _form.Role);
+                }
+            }
+            if (result.Succeeded && !string.IsNullOrEmpty(_form.Password))
+            {
+                var token = await UserManager.GeneratePasswordResetTokenAsync(user);
+                result = await UserManager.ResetPasswordAsync(user, token, _form.Password);
+            }
+            // Role / status / password changes invalidate existing sessions.
+            if (result.Succeeded) await UserManager.UpdateSecurityStampAsync(user);
+        }
+
+        if (!result.Succeeded)
+        {
+            Toasts.Error(string.Join(" ", result.Errors.Select(e => e.Description)));
+            return;
+        }
+        await Audit.WriteAsync(_form.Id is null ? "user.create" : "user.update", "User", user.Id, $"{user.Email} role={_form.Role} active={_form.IsActive}{(string.IsNullOrEmpty(_form.Password) ? "" : " password-changed")}");
+        _form = null;
+        await LoadAsync();
+        Toasts.Success("User saved");
+    }
+
+    private async Task RevokeSessionsAsync(ApplicationUser u)
+    {
+        await UserManager.UpdateSecurityStampAsync(u);
+        await Audit.WriteAsync("user.revoke-sessions", "User", u.Id, u.Email);
+        Toasts.Success($"All sessions of {u.Email} will be signed out within a minute.");
+    }
+
+    private async Task UnlockAsync(ApplicationUser u)
+    {
+        await UserManager.SetLockoutEndDateAsync(u, null);
+        await UserManager.ResetAccessFailedCountAsync(u);
+        await Audit.WriteAsync("user.unlock", "User", u.Id, u.Email);
+        await LoadAsync();
+    }
+
+    private async Task DeleteAsync(ApplicationUser u)
+    {
+        await UserManager.DeleteAsync(u);
+        await Audit.WriteAsync("user.delete", "User", u.Id, u.Email);
+        await LoadAsync();
+        Toasts.Success("User deleted");
+    }
+}

@@ -1,0 +1,142 @@
+﻿@inherits LayoutComponentBase
+@implements IDisposable
+@inject LiveUpdates Live
+@inject ToastService Toasts
+@inject ILiveStateCache Cache
+@inject IServiceScopeFactory Scopes
+@inject NavigationManager Nav
+
+<div class="app-shell @(_collapsed ? "collapsed" : "")">
+    <aside class="sidebar glass">
+        <div class="brand">
+            <span class="brand-mark"><i class="bi bi-activity"></i></span>
+            <span class="brand-text">Server<b>Monitor</b></span>
+        </div>
+        <nav class="nav-list">
+            <NavLink class="nav-item-link" href="" Match="NavLinkMatch.All"><i class="bi bi-grid-1x2"></i><span>Overview</span></NavLink>
+            <NavLink class="nav-item-link" href="servers"><i class="bi bi-hdd-rack"></i><span>Servers</span></NavLink>
+            <NavLink class="nav-item-link" href="performance"><i class="bi bi-cpu"></i><span>Performance</span></NavLink>
+            <NavLink class="nav-item-link" href="network"><i class="bi bi-diagram-3"></i><span>Network</span></NavLink>
+            <NavLink class="nav-item-link" href="services"><i class="bi bi-gear-wide-connected"></i><span>Services</span></NavLink>
+            <NavLink class="nav-item-link" href="ports"><i class="bi bi-plug"></i><span>Ports</span></NavLink>
+            <NavLink class="nav-item-link" href="security"><i class="bi bi-shield-check"></i><span>Security</span></NavLink>
+            <NavLink class="nav-item-link" href="logs"><i class="bi bi-terminal"></i><span>Logs</span></NavLink>
+            <NavLink class="nav-item-link" href="alerts">
+                <i class="bi bi-bell"></i><span>Alerts</span>
+                @if (_openAlerts > 0) { <span class="badge-pill critical">@_openAlerts</span> }
+            </NavLink>
+            <NavLink class="nav-item-link" href="reports"><i class="bi bi-file-earmark-bar-graph"></i><span>Reports</span></NavLink>
+            <AuthorizeView Roles="@Roles.Admin">
+                <div class="nav-section">Administration</div>
+                <NavLink class="nav-item-link" href="users"><i class="bi bi-people"></i><span>Users</span></NavLink>
+                <NavLink class="nav-item-link" href="audit"><i class="bi bi-journal-text"></i><span>Audit log</span></NavLink>
+                <NavLink class="nav-item-link" href="settings"><i class="bi bi-sliders"></i><span>Settings</span></NavLink>
+            </AuthorizeView>
+        </nav>
+        <div class="sidebar-footer">
+            <AuthorizeView>
+                <div class="user-chip">
+                    <i class="bi bi-person-circle"></i>
+                    <div class="user-meta">
+                        <div class="user-name" title="@context.User.Identity?.Name">@context.User.Identity?.Name</div>
+                        <div class="user-role">@RoleOf(context.User)</div>
+                    </div>
+                    <form method="post" action="account/logout" class="ms-auto">
+                        <AntiforgeryToken />
+                        <button type="submit" class="icon-btn" title="Sign out"><i class="bi bi-box-arrow-right"></i></button>
+                    </form>
+                </div>
+            </AuthorizeView>
+        </div>
+    </aside>
+
+    <main class="content">
+        <header class="topbar">
+            <button class="icon-btn" @onclick="() => _collapsed = !_collapsed" title="Toggle sidebar"><i class="bi bi-list"></i></button>
+            <div class="topbar-status">
+                <span class="live-dot"></span> Live
+                <span class="text-secondary ms-3 small">@_onlineCount / @_totalCount servers online</span>
+            </div>
+            <div class="ms-auto d-flex align-items-center gap-2">
+                <a class="icon-btn position-relative" href="alerts" title="Notification center">
+                    <i class="bi bi-bell"></i>
+                    @if (_openAlerts > 0) { <span class="dot-badge"></span> }
+                </a>
+            </div>
+        </header>
+        <div class="page">
+            <ErrorBoundary @ref="_boundary">
+                <ChildContent>@Body</ChildContent>
+                <ErrorContent Context="ex">
+                    <div class="glass p-4">
+                        <h5 class="text-danger"><i class="bi bi-exclamation-octagon me-2"></i>Something went wrong</h5>
+                        <p class="text-secondary">@(ex is UnauthorizedAccessException ? ex.Message : "An unexpected error occurred. Details were written to the server log.")</p>
+                        <button class="btn btn-sm btn-outline-light" @onclick="Recover">Try again</button>
+                    </div>
+                </ErrorContent>
+            </ErrorBoundary>
+        </div>
+    </main>
+</div>
+
+<ToastHost />
+
+@code {
+    private bool _collapsed;
+    private int _openAlerts, _onlineCount, _totalCount;
+    private ErrorBoundary? _boundary;
+    private DateTime _lastRender = DateTime.MinValue;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Live.ServerUpdated += OnServer;
+        Live.AlertChanged += OnAlert;
+        await RefreshCountsAsync();
+    }
+
+    protected override void OnParametersSet() => _boundary?.Recover();
+
+    private void Recover() => _boundary?.Recover();
+
+    private async Task RefreshCountsAsync()
+    {
+        using var scope = Scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<IMonitorDbContext>();
+        _openAlerts = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.CountAsync(db.Alerts, a => a.Status == AlertStatus.Open);
+        var all = Cache.All().Where(s => s.MonitoringEnabled).ToList();
+        _totalCount = all.Count;
+        _onlineCount = all.Count(s => s.Status is not (HealthStatus.Offline or HealthStatus.Unknown));
+    }
+
+    private void OnServer(ServerLiveState s)
+    {
+        // Throttle header re-renders to once every 2 seconds.
+        if ((DateTime.UtcNow - _lastRender).TotalSeconds < 2) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(async () => { await RefreshCountsAsync(); StateHasChanged(); });
+    }
+
+    private void OnAlert(Alert a)
+    {
+        _ = InvokeAsync(async () =>
+        {
+            await RefreshCountsAsync();
+            if (a.Status == AlertStatus.Open && a.OccurrenceCount == 1)
+            {
+                if (a.Severity == AlertSeverity.Critical) Toasts.Error(a.Title);
+                else Toasts.Warning(a.Title);
+            }
+            else if (a.Status == AlertStatus.Resolved && a.ResolvedBy == "system") Toasts.Success("Resolved: " + a.Title);
+            StateHasChanged();
+        });
+    }
+
+    private static string RoleOf(System.Security.Claims.ClaimsPrincipal u) =>
+        u.IsInRole(Roles.Admin) ? Roles.Admin : u.IsInRole(Roles.Operator) ? Roles.Operator : Roles.Viewer;
+
+    public void Dispose()
+    {
+        Live.ServerUpdated -= OnServer;
+        Live.AlertChanged -= OnAlert;
+    }
+}

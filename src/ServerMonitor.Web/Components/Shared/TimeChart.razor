@@ -1,0 +1,83 @@
+@implements IAsyncDisposable
+@inject IJSRuntime JS
+
+<div class="chart-card glass">
+    <div class="chart-head">
+        <div>
+            <div class="chart-title">@Title</div>
+            @if (ShowSummary && Series.Count > 0)
+            {
+                var s = Series[0].Summary;
+                <div class="chart-summary">
+                    <span>min <b>@F(s.Min)</b></span><span>avg <b>@F(s.Avg)</b></span><span>max <b>@F(s.Max)</b></span><span>last <b>@F(s.Last)</b></span>
+                </div>
+            }
+        </div>
+        @HeaderContent
+    </div>
+    @if (Loading)
+    {
+        <div class="skeleton" style="height:@(Height)px"></div>
+    }
+    else if (Series.All(s => s.Points.Count == 0))
+    {
+        <div class="chart-empty" style="height:@(Height)px">No data in this range yet.</div>
+    }
+    <div id="@_id" style="@(Loading || Series.All(s => s.Points.Count == 0) ? "display:none" : "")"></div>
+</div>
+
+@code {
+    private readonly string _id = "chart-" + Guid.NewGuid().ToString("N")[..10];
+    private bool _created;
+
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public IReadOnlyList<Series> Series { get; set; } = [];
+    /// <summary>percent | bytes | rate | ms | number</summary>
+    [Parameter] public string Unit { get; set; } = "number";
+    [Parameter] public int Height { get; set; } = 240;
+    [Parameter] public bool Loading { get; set; }
+    [Parameter] public bool ShowSummary { get; set; } = true;
+    [Parameter] public string Type { get; set; } = "area";
+    [Parameter] public double? Max { get; set; }
+    [Parameter] public RenderFragment? HeaderContent { get; set; }
+
+    private string F(double? v) => Unit switch
+    {
+        "percent" => Fmt.Pct(v),
+        "bytes" => Fmt.Bytes(v),
+        "rate" => Fmt.Rate(v),
+        "ms" => Fmt.Ms(v),
+        _ => Fmt.Num(v)
+    };
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (Loading) return;
+        var payload = Series.Select(s => new
+        {
+            name = s.Name,
+            data = s.Points.Select(p => new object?[] { p.Time.ToUnixTimeMilliseconds(), p.Value })
+        }).ToList();
+        try
+        {
+            if (!_created)
+            {
+                await JS.InvokeVoidAsync("smCharts.create", _id, new { type = Type, unit = Unit, height = Height, max = Max }, payload);
+                _created = true;
+            }
+            else
+            {
+                await JS.InvokeVoidAsync("smCharts.update", _id, payload);
+            }
+        }
+        catch (JSDisconnectedException) { }
+        catch (InvalidOperationException) { /* prerendering */ }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { await JS.InvokeVoidAsync("smCharts.destroy", _id); }
+        catch (JSDisconnectedException) { }
+        catch (InvalidOperationException) { }
+    }
+}

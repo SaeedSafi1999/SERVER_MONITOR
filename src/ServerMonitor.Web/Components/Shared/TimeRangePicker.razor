@@ -1,0 +1,49 @@
+<div class="range-picker">
+    @foreach (var (key, label, _) in Presets)
+    {
+        <button class="chip @(Selected == key ? "active" : "")" @onclick="() => SelectAsync(key)">@label</button>
+    }
+    <button class="chip @(Selected == "custom" ? "active" : "")" @onclick='() => { Selected = "custom"; }'>Custom</button>
+    @if (Selected == "custom")
+    {
+        <input type="datetime-local" class="form-control form-control-sm w-auto" @bind="_customFrom" />
+        <span class="text-secondary">→</span>
+        <input type="datetime-local" class="form-control form-control-sm w-auto" @bind="_customTo" />
+        <button class="btn btn-sm btn-primary" @onclick="ApplyCustomAsync">Apply</button>
+    }
+</div>
+
+@code {
+    public static readonly (string Key, string Label, TimeSpan Span)[] Presets =
+    [
+        ("5m", "5m", TimeSpan.FromMinutes(5)), ("15m", "15m", TimeSpan.FromMinutes(15)), ("1h", "1h", TimeSpan.FromHours(1)),
+        ("6h", "6h", TimeSpan.FromHours(6)), ("24h", "24h", TimeSpan.FromHours(24)), ("7d", "7d", TimeSpan.FromDays(7))
+    ];
+
+    [Parameter] public string Selected { get; set; } = "1h";
+    [Parameter] public EventCallback<(DateTimeOffset From, DateTimeOffset To, string Key)> OnChange { get; set; }
+
+    private DateTime _customFrom = DateTime.Now.AddHours(-3);
+    private DateTime _customTo = DateTime.Now;
+
+    public static (DateTimeOffset From, DateTimeOffset To) Resolve(string key)
+    {
+        var span = Presets.FirstOrDefault(p => p.Key == key).Span;
+        if (span == default) span = TimeSpan.FromHours(1);
+        var to = DateTimeOffset.UtcNow;
+        return (to - span, to);
+    }
+
+    private async Task SelectAsync(string key)
+    {
+        Selected = key;
+        var (f, t) = Resolve(key);
+        await OnChange.InvokeAsync((f, t, key));
+    }
+
+    private async Task ApplyCustomAsync()
+    {
+        if (_customTo <= _customFrom) return;
+        await OnChange.InvokeAsync((new DateTimeOffset(_customFrom).ToUniversalTime(), new DateTimeOffset(_customTo).ToUniversalTime(), "custom"));
+    }
+}

@@ -1,0 +1,202 @@
+@page "/servers"
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+@inject ToastService Toasts
+@inject NavigationManager Nav
+
+<PageTitle>Servers · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Servers</h1>
+        <div class="sub">Manage monitored hosts, groups and connection settings</div>
+    </div>
+    <div class="actions">
+        <select class="form-select form-select-sm w-auto" @bind="_groupFilter">
+            <option value="0">All groups</option>
+            @foreach (var g in _groups) { <option value="@g.Id">@g.Name</option> }
+        </select>
+        <input class="form-control form-control-sm w-auto" placeholder="Filter…" @bind="_filter" @bind:event="oninput" />
+        <AuthorizeView Roles="@Roles.Admin">
+            <button class="btn btn-sm btn-outline-light" @onclick="() => _showGroups = !_showGroups"><i class="bi bi-collection me-1"></i>Groups</button>
+            <a class="btn btn-sm btn-primary" href="servers/new"><i class="bi bi-plus-lg me-1"></i>Add server</a>
+        </AuthorizeView>
+    </div>
+</div>
+
+@if (_showGroups)
+{
+    <div class="glass form-section">
+        <h2>Server groups</h2>
+        <div class="d-flex gap-2 mb-3">
+            <input class="form-control form-control-sm" placeholder="New group name" @bind="_newGroup" maxlength="128" />
+            <button class="btn btn-sm btn-primary" @onclick="AddGroupAsync">Add</button>
+        </div>
+        @foreach (var g in _groups)
+        {
+            <span class="pill-tag me-2">@g.Name <button class="icon-btn" style="width:20px;height:20px" @onclick="() => DeleteGroupAsync(g)"><i class="bi bi-x"></i></button></span>
+        }
+    </div>
+}
+
+<div class="glass table-wrap">
+    @if (_servers is null)
+    {
+        <div class="p-3"><div class="skeleton" style="height:200px"></div></div>
+    }
+    else
+    {
+        <table class="table-dark-glass">
+            <thead>
+                <tr>
+                    <th>Status</th><th>Name</th><th>Host</th><th>OS</th><th>Protocol</th><th>Group / Tags</th><th>Interval</th><th>Connection</th><th>Last data</th><th>Monitoring</th><th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var s in Filtered)
+                {
+                    var live = Cache.Get(s.Id);
+                    <tr @key="s.Id">
+                        <td><StatusBadge Status="live?.Status ?? s.Status" /></td>
+                        <td><a href="servers/@s.Id">@s.Name</a><div class="small text-secondary">@s.Location</div></td>
+                        <td class="mono">@s.Host:@s.ManagementPort</td>
+                        <td><i class="bi @(s.IsWindows ? "bi-windows" : "bi-ubuntu") me-1"></i>@(s.OsVersion ?? s.OperatingSystem.ToString())</td>
+                        <td>@s.Protocol</td>
+                        <td>
+                            @if (s.Group is not null) { <span class="pill-tag" style="background:rgba(161,161,170,.15);color:#d4d4d8">@s.Group.Name</span> }
+                            @foreach (var t in s.TagList) { <span class="pill-tag">@t</span> }
+                        </td>
+                        <td>@s.MonitoringIntervalSeconds s</td>
+                        <td>
+                            <span class="small @((live?.ConnectionState ?? s.ConnectionState) == ConnectionState.Connected ? "text-success" : "text-warning")">@(live?.ConnectionState ?? s.ConnectionState)</span>
+                        </td>
+                        <td class="small">@Fmt.Ago(live?.LastSeenAt ?? s.LastSeenAt)</td>
+                        <td>
+                            <AuthorizeView Roles="@Roles.Admin">
+                                <Authorized>
+                                    <div class="form-check form-switch m-0">
+                                        <input class="form-check-input" type="checkbox" checked="@s.IsMonitoringEnabled" @onchange="e => ToggleAsync(s, (bool)e.Value!)" />
+                                    </div>
+                                </Authorized>
+                                <NotAuthorized>@(s.IsMonitoringEnabled ? "On" : "Off")</NotAuthorized>
+                            </AuthorizeView>
+                        </td>
+                        <td class="text-end text-nowrap">
+                            <a class="icon-btn" href="servers/@s.Id" title="Details"><i class="bi bi-graph-up"></i></a>
+                            <AuthorizeView Roles="@Roles.Admin">
+                                <a class="icon-btn" href="servers/@s.Id/edit" title="Edit"><i class="bi bi-pencil"></i></a>
+                                <button class="icon-btn" title="Delete" @onclick="() => _confirmDelete = s"><i class="bi bi-trash"></i></button>
+                            </AuthorizeView>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+        @if (!Filtered.Any())
+        {
+            <div class="p-4 text-center text-secondary">No servers match.</div>
+        }
+    }
+</div>
+
+@if (_confirmDelete is not null)
+{
+    <div class="modal d-block" style="background:rgba(0,0,0,.5)">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content glass">
+                <div class="modal-body">
+                    <h5>Delete @_confirmDelete.Name?</h5>
+                    <p class="text-secondary">All metrics, probes, alerts and history for this server will be permanently removed.</p>
+                    <div class="d-flex justify-content-end gap-2">
+                        <button class="btn btn-sm btn-outline-light" @onclick="() => _confirmDelete = null">Cancel</button>
+                        <button class="btn btn-sm btn-danger" @onclick="DeleteAsync">Delete</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<Server>? _servers;
+    private List<ServerGroup> _groups = [];
+    private string _filter = "";
+    private int _groupFilter;
+    private bool _showGroups;
+    private string _newGroup = "";
+    private Server? _confirmDelete;
+    private DateTime _lastRender;
+
+    private IEnumerable<Server> Filtered => (_servers ?? [])
+        .Where(s => _groupFilter == 0 || s.GroupId == _groupFilter)
+        .Where(s => string.IsNullOrWhiteSpace(_filter) || s.Name.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                    || s.Host.Contains(_filter, StringComparison.OrdinalIgnoreCase) || s.Tags.Contains(_filter, StringComparison.OrdinalIgnoreCase));
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private async Task LoadAsync()
+    {
+        _servers = await Svc.ListAsync();
+        _groups = await Svc.GroupsAsync();
+    }
+
+    private void OnUpdate(ServerLiveState state)
+    {
+        if ((DateTime.UtcNow - _lastRender).TotalSeconds < 1) return;
+        _lastRender = DateTime.UtcNow;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ToggleAsync(Server s, bool enabled)
+    {
+        try
+        {
+            await Svc.SetMonitoringAsync(s.Id, enabled);
+            s.IsMonitoringEnabled = enabled;
+            Toasts.Success($"Monitoring {(enabled ? "enabled" : "disabled")} for {s.Name}");
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task DeleteAsync()
+    {
+        if (_confirmDelete is null) return;
+        try
+        {
+            await Svc.DeleteAsync(_confirmDelete.Id);
+            Toasts.Success($"{_confirmDelete.Name} deleted");
+            _confirmDelete = null;
+            await LoadAsync();
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task AddGroupAsync()
+    {
+        try
+        {
+            await Svc.CreateGroupAsync(_newGroup, null);
+            _newGroup = "";
+            _groups = await Svc.GroupsAsync();
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task DeleteGroupAsync(ServerGroup g)
+    {
+        try
+        {
+            await Svc.DeleteGroupAsync(g.Id);
+            await LoadAsync();
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

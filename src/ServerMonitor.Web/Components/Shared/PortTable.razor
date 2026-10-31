@@ -1,0 +1,128 @@
+@implements IDisposable
+@inject ServerManagementService Svc
+@inject LiveUpdates Live
+@inject ToastService Toasts
+
+@if (ServerId is not null)
+{
+    <AuthorizeView Roles="@Roles.Admin">
+        <div class="glass form-section">
+            <h2>Add port check</h2>
+            <div class="d-flex flex-wrap gap-2 align-items-center">
+                @foreach (var (port, name) in Common)
+                {
+                    <button class="chip" @onclick="() => AddAsync(port, name)">@port <span class="text-secondary">@name</span></button>
+                }
+                <input type="number" class="form-control form-control-sm" style="width:110px" placeholder="Port" min="1" max="65535" @bind="_port" />
+                <input class="form-control form-control-sm w-auto" placeholder="Service name" @bind="_name" maxlength="64" />
+                <button class="btn btn-sm btn-outline-light" @onclick="() => AddAsync(_port ?? 0, _name)">Add</button>
+            </div>
+            <div class="small text-secondary mt-2">Only the ports listed here are checked (TCP connect). Range scanning is intentionally not supported.</div>
+        </div>
+    </AuthorizeView>
+}
+
+<div class="glass table-wrap">
+    @if (_rows is null)
+    {
+        <div class="p-3"><div class="skeleton" style="height:160px"></div></div>
+    }
+    else if (_rows.Count == 0)
+    {
+        <div class="p-4 text-center text-secondary">No ports configured.</div>
+    }
+    else
+    {
+        <table class="table-dark-glass">
+            <thead>
+                <tr>
+                    @if (ServerId is null) { <th>Server</th> }
+                    <th>Port</th><th>Protocol</th><th>Service</th><th>State</th><th>Response time</th><th>Last change</th><th>Last check</th><th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var p in _rows)
+                {
+                    <tr @key="p.Id">
+                        @if (ServerId is null) { <td><a href="servers/@p.ServerId">@p.Server?.Name</a></td> }
+                        <td class="mono">@p.Port</td>
+                        <td>@p.Protocol</td>
+                        <td>@p.ServiceName</td>
+                        <td>
+                            @if (p.IsOpen is null) { <span class="status-badge"><span class="dot"></span>pending</span> }
+                            else if (p.IsOpen == true) { <span class="status-badge healthy"><span class="dot"></span>open</span> }
+                            else { <span class="status-badge @(p.ExpectOpen ? "critical" : "")"><span class="dot"></span>closed</span> <span class="small text-secondary">@p.LastError</span> }
+                        </td>
+                        <td>@Fmt.Ms(p.ResponseTimeMs)</td>
+                        <td class="small">@Fmt.Time(p.LastChangedAt)</td>
+                        <td class="small">@Fmt.Ago(p.LastCheckedAt)</td>
+                        <td class="text-end">
+                            <AuthorizeView Roles="@Roles.Admin">
+                                <button class="icon-btn" title="Remove" @onclick="() => RemoveAsync(p)"><i class="bi bi-trash"></i></button>
+                            </AuthorizeView>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</div>
+
+@code {
+    [Parameter] public int? ServerId { get; set; }
+
+    private static readonly (int Port, string Name)[] Common =
+        [(22, "SSH"), (80, "HTTP"), (443, "HTTPS"), (3306, "MySQL"), (5432, "PostgreSQL"), (3389, "RDP"), (1433, "MSSQL"), (6379, "Redis")];
+
+    private List<MonitoredPort>? _rows;
+    private int? _port;
+    private string _name = "";
+    private DateTime _lastReload;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadAsync();
+        Live.ServerUpdated -= OnUpdate;
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private async Task LoadAsync()
+    {
+        if (ServerId is not null)
+        {
+            var server = await Svc.GetAsync(ServerId.Value);
+            _rows = server?.Ports.OrderBy(p => p.Port).ToList() ?? [];
+        }
+        else
+        {
+            _rows = (await Svc.AllPortsAsync()).OrderBy(p => p.IsOpen == true).ThenBy(p => p.Server!.Name).ThenBy(p => p.Port).ToList();
+        }
+    }
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if (ServerId is not null && s.ServerId != ServerId) return;
+        if ((DateTime.UtcNow - _lastReload).TotalSeconds < 5) return;
+        _lastReload = DateTime.UtcNow;
+        _ = InvokeAsync(async () => { await LoadAsync(); StateHasChanged(); });
+    }
+
+    private async Task AddAsync(int port, string? name)
+    {
+        try
+        {
+            await Svc.AddPortAsync(ServerId!.Value, port, string.IsNullOrWhiteSpace(name) ? null : name, expectOpen: true);
+            _port = null; _name = "";
+            await LoadAsync();
+        }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    private async Task RemoveAsync(MonitoredPort p)
+    {
+        try { await Svc.RemovePortAsync(p.Id); await LoadAsync(); }
+        catch (Exception ex) { Toasts.Error(ex.Message); }
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

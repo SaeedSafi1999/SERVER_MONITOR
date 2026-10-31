@@ -1,0 +1,98 @@
+@page "/reports"
+@inject MetricsQueryService Metrics
+@inject IJSRuntime JS
+
+<PageTitle>Reports · ServerMonitor</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Availability &amp; SLA report</h1>
+        <div class="sub">@Fmt.Time(_from) → @Fmt.Time(_to) · uptime excludes periods when a server was not monitored</div>
+    </div>
+    <div class="actions no-print">
+        @foreach (var (k, label) in new[] { ("day", "Daily"), ("week", "Weekly"), ("month", "Monthly"), ("prevmonth", "Previous month") })
+        {
+            <button class="chip @(_period == k ? "active" : "")" @onclick="() => LoadAsync(k)">@label</button>
+        }
+        <button class="btn btn-sm btn-outline-light" @onclick="ExportCsvAsync"><i class="bi bi-filetype-csv me-1"></i>CSV</button>
+        <button class="btn btn-sm btn-outline-light" @onclick='() => JS.InvokeVoidAsync("smPrint")'><i class="bi bi-filetype-pdf me-1"></i>PDF</button>
+    </div>
+</div>
+
+@if (_rows is null)
+{
+    <div class="skeleton" style="height:300px"></div>
+}
+else
+{
+    <div class="stat-grid">
+        <StatCard Label="Servers meeting SLA" Value="@($"{_rows.Count(r => r.Report.SlaMet)} / {_rows.Count}")" Icon="bi-check2-all" Kind="@(_rows.All(r => r.Report.SlaMet) ? "healthy" : "warning")" />
+        <StatCard Label="Fleet uptime" Value="@($"{(_rows.Count == 0 ? 100 : _rows.Average(r => r.Report.UptimePercent)):0.000}%")" Icon="bi-graph-up" />
+        <StatCard Label="Total downtime" Value="@Fmt.Duration(TimeSpan.FromSeconds(_rows.Sum(r => r.Report.Downtime.TotalSeconds)))" Icon="bi-x-octagon" />
+        <StatCard Label="Incidents" Value="@_rows.Sum(r => r.Report.Incidents).ToString()" Icon="bi-lightning" />
+    </div>
+    <div class="glass table-wrap">
+        <table class="table-dark-glass">
+            <thead><tr><th>Server</th><th>Uptime</th><th>SLA</th><th>Downtime</th><th>Incidents</th><th>MTTR</th><th>MTBF</th><th>Error budget left</th><th>Not monitored</th></tr></thead>
+            <tbody>
+                @foreach (var (server, r) in _rows)
+                {
+                    <tr>
+                        <td><a href="servers/@server.Id">@server.Name</a></td>
+                        <td class="mono">@($"{r.UptimePercent:0.000}%")</td>
+                        <td><span class="status-badge @(r.SlaMet ? "healthy" : "critical")"><span class="dot"></span>@(r.SlaMet ? "met" : "missed") (@r.SlaTarget%)</span></td>
+                        <td>@Fmt.Duration(r.Downtime)</td>
+                        <td>@r.Incidents</td>
+                        <td>@Fmt.Duration(r.Mttr)</td>
+                        <td>@Fmt.Duration(r.Mtbf)</td>
+                        <td class="@(r.ErrorBudgetRemaining < TimeSpan.Zero ? "text-danger" : "")">@(r.ErrorBudgetRemaining < TimeSpan.Zero ? "−" + Fmt.Duration(-r.ErrorBudgetRemaining) : Fmt.Duration(r.ErrorBudgetRemaining))</td>
+                        <td class="text-secondary">@Fmt.Duration(r.Unknown)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+    <p class="small text-secondary mt-3">
+        Per-server metric and probe history can be exported as CSV from each server's Performance and Latency tabs, or via
+        <code>GET /api/v1/servers/{id}/export/metrics.csv?from=…&amp;to=…</code>.
+    </p>
+}
+
+@code {
+    private List<(Server Server, AvailabilityReport Report)>? _rows;
+    private string _period = "week";
+    private DateTimeOffset _from, _to;
+
+    protected override Task OnInitializedAsync() => LoadAsync("week");
+
+    private async Task LoadAsync(string period)
+    {
+        _period = period;
+        var now = DateTimeOffset.UtcNow;
+        (_from, _to) = period switch
+        {
+            "day" => (now.AddDays(-1), now),
+            "month" => (now.AddDays(-30), now),
+            "prevmonth" => PrevMonth(now),
+            _ => (now.AddDays(-7), now)
+        };
+        _rows = await Metrics.SlaReportAsync(_from, _to);
+    }
+
+    private static (DateTimeOffset, DateTimeOffset) PrevMonth(DateTimeOffset now)
+    {
+        var firstThis = new DateTimeOffset(now.Year, now.Month, 1, 0, 0, 0, TimeSpan.Zero);
+        return (firstThis.AddMonths(-1), firstThis);
+    }
+
+    private async Task ExportCsvAsync()
+    {
+        if (_rows is null) return;
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        var sb = new System.Text.StringBuilder("server,from_utc,to_utc,uptime_percent,sla_target,sla_met,downtime_s,incidents,mttr_s,mtbf_s,unmonitored_s\n");
+        foreach (var (s, r) in _rows)
+            sb.AppendLine(string.Join(',', MetricsQueryService.Csv(s.Name), _from.UtcDateTime.ToString("O"), _to.UtcDateTime.ToString("O"), r.UptimePercent.ToString("0.0000", c),
+                r.SlaTarget.ToString(c), r.SlaMet, (long)r.Downtime.TotalSeconds, r.Incidents, (long?)r.Mttr?.TotalSeconds, (long?)r.Mtbf?.TotalSeconds, (long)r.Unknown.TotalSeconds));
+        await JS.InvokeVoidAsync("smDownload", $"sla-{_period}-{DateTime.UtcNow:yyyyMMdd}.csv", "text/csv", sb.ToString());
+    }
+}

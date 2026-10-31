@@ -1,0 +1,101 @@
+@implements IDisposable
+@inject AlertManagementService AlertSvc
+@inject ServerManagementService Svc
+@inject ILiveStateCache Cache
+@inject LiveUpdates Live
+
+@{
+    var scan = ServerId is null ? null : Cache.Get(ServerId.Value)?.Security;
+    var server = ServerId is null ? null : _server;
+}
+
+@if (ServerId is not null)
+{
+    @if (scan is null)
+    {
+        <div class="glass p-4 text-secondary mb-3"><i class="bi bi-hourglass-split me-2"></i>Waiting for the first security scan (runs every few minutes once the host is connected).</div>
+    }
+    else
+    {
+        @foreach (var w in scan.Warnings) { <div class="alert alert-warning glass py-2 small">@w</div> }
+        <div class="stat-grid">
+            <StatCard Label="Failed logins" Value="@scan.FailedLogins.Count.ToString()" Sub="since previous scan" Icon="bi-person-x" Kind="@(scan.FailedLogins.Count > 10 ? "critical" : scan.FailedLogins.Count > 0 ? "warning" : "healthy")" />
+            <StatCard Label="Successful logins" Value="@scan.SuccessfulLogins.Count.ToString()" Sub="interactive / remote" Icon="bi-person-check" />
+            <StatCard Label="Firewall" Value="@(scan.FirewallActive switch { true => "Active", false => "Inactive", _ => "Unknown" })" Sub="@scan.FirewallDetails" Icon="bi-bricks" Kind="@(scan.FirewallActive == false ? "critical" : scan.FirewallActive == true ? "healthy" : "")" />
+            <StatCard Label="Pending updates" Value="@(scan.PendingUpdates?.ToString() ?? "—")" Sub="@($"{scan.PendingSecurityUpdates?.ToString() ?? "?"} security · reboot {(scan.RebootRequired == true ? "required" : "not required")}")" Icon="bi-arrow-up-circle" Kind="@(scan.PendingSecurityUpdates > 0 ? "warning" : "")" />
+            <StatCard Label="Disk encryption" Value="@(scan.DiskEncryption?.Split(' ')[0] ?? "—")" Sub="@scan.DiskEncryption" Icon="bi-lock" />
+            <StatCard Label="TLS certificate" Value="@(server?.CertificateNotAfter is { } na ? $"{(na - DateTimeOffset.UtcNow).TotalDays:0} days" : "—")" Sub="@(server?.CertificateNotAfter is null ? "no HTTPS health check" : (server.CertificateValid == true ? "valid chain · " : "INVALID chain · ") + server.CertificateSubject)" Icon="bi-patch-check" Kind="@(server?.CertificateValid == false ? "critical" : server?.CertificateNotAfter is { } n2 && (n2 - DateTimeOffset.UtcNow).TotalDays < 21 ? "warning" : "")" />
+        </div>
+        <div class="glass table-wrap mb-3">
+            <div class="chart-title px-3 pt-2">Listening TCP ports (@scan.ListeningPorts.Count)</div>
+            <div class="px-3 pb-3 pt-2">
+                @foreach (var p in scan.ListeningPorts) { <span class="pill-tag mono" style="background:rgba(161,161,170,.12);color:#d4d4d8">@p.Address:@p.Port</span> }
+            </div>
+        </div>
+    }
+}
+
+<div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+    <select class="form-select form-select-sm w-auto" @bind="_type" @bind:after="LoadAsync">
+        <option value="">All event types</option>
+        @foreach (var t in Enum.GetValues<SecurityEventType>()) { <option value="@t">@t</option> }
+    </select>
+    <select class="form-select form-select-sm w-auto" @bind="_days" @bind:after="LoadAsync">
+        <option value="1">Last 24 hours</option>
+        <option value="7">Last 7 days</option>
+        <option value="30">Last 30 days</option>
+    </select>
+    <span class="text-secondary small ms-auto">@_events.Count events</span>
+</div>
+<div class="glass table-wrap" style="max-height:60vh">
+    <table class="table-dark-glass">
+        <thead><tr><th>Time</th>@if (ServerId is null) { <th>Server</th> }<th>Type</th><th>Severity</th><th>User</th><th>Source IP</th><th>Message</th></tr></thead>
+        <tbody>
+            @foreach (var e in _events)
+            {
+                <tr>
+                    <td class="small text-nowrap">@Fmt.Time(e.Timestamp)</td>
+                    @if (ServerId is null) { <td><a href="servers/@e.ServerId">@_names.GetValueOrDefault(e.ServerId)</a></td> }
+                    <td>@e.Type</td>
+                    <td><span class="status-badge @Fmt.SeverityClass(e.Severity)"><span class="dot"></span>@e.Severity</span></td>
+                    <td class="mono small">@e.UserName</td>
+                    <td class="mono small">@e.SourceIp</td>
+                    <td class="small text-break">@e.Message</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    [Parameter] public int? ServerId { get; set; }
+
+    private Server? _server;
+    private List<SecurityEvent> _events = [];
+    private Dictionary<int, string> _names = [];
+    private SecurityEventType? _type;
+    private int _days = 1;
+    private DateTime _lastReload;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (ServerId is not null) _server = await Svc.GetAsync(ServerId.Value);
+        else _names = (await Svc.ListAsync()).ToDictionary(s => s.Id, s => s.Name);
+        await LoadAsync();
+        Live.ServerUpdated -= OnUpdate;
+        Live.ServerUpdated += OnUpdate;
+    }
+
+    private async Task LoadAsync() =>
+        _events = await AlertSvc.SecurityEventsAsync(ServerId, _type, DateTimeOffset.UtcNow.AddDays(-_days), 1000);
+
+    private void OnUpdate(ServerLiveState s)
+    {
+        if (ServerId is not null && s.ServerId != ServerId) return;
+        if ((DateTime.UtcNow - _lastReload).TotalSeconds < 10) return;
+        _lastReload = DateTime.UtcNow;
+        _ = InvokeAsync(async () => { await LoadAsync(); StateHasChanged(); });
+    }
+
+    public void Dispose() => Live.ServerUpdated -= OnUpdate;
+}

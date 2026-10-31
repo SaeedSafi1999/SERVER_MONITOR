@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "servermonitor-dev",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "src/ServerMonitor.Web", "--no-launch-profile", "--urls", "http://localhost:5080"],
+      "port": 5080,
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "ConnectionStrings__Monitor": "Host=localhost;Port=55432;Database=servermonitor;Username=postgres",
+        "Https__Redirect": "false",
+        "DataProtection__KeysPath": ".dev-keys",
+        "Seed__AdminEmail": "admin@local.test",
+        "Seed__AdminPassword": "DevOnly-Test#2026-Monitor"
+      }
+    }
+  ]
+}
